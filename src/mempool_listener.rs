@@ -43,8 +43,8 @@ impl Default for MempoolListenerConfig {
             endpoints:              vec![],
             stealth:                false,
             extra_endpoints:        vec![],
-            worker_count:           8,
-            fetcher_count:          16,
+            worker_count:           4, // [HF FIX] Reduced threads to save stack memory
+            fetcher_count:          4, // [HF FIX] Prevents CPU starvation
             tracked_pools:          Arc::new(FxHashSet::default()),
             use_txpool_content:     false,
             txpool_poll_interval_ms: 200,

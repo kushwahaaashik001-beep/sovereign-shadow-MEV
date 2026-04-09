@@ -231,8 +231,8 @@ impl HotGraph {
         }
 
         // Pillar C: Expanded Breadth for 3500+ Pools scale
-        // [MEMORY FIX] Reduced breadth to prevent path explosion (100/40 is optimal for 16Gi RAM)
-        let breadth = if current_path.is_empty() { 100 } else { 40 }; 
+        // [BULLETPROOF FIX] Focused breadth: 20/10 is enough for High-Liquidity Alpha.
+        let breadth = if current_path.is_empty() { 20 } else { 10 }; 
         let current_token_addr = data.idx_to_address[current_idx];
 
         for edge in data.edge_map[current_idx].iter().take(breadth) {
@@ -371,9 +371,10 @@ impl SharedState {
     fn prune_memory(&self) {
         let current_block = self.mirror.current_block_number();
         
-        // [MEMORY FIX] Aggressive block-based pruning for seen txs. 
-        // MEV transactions expire every block, no need to keep 10k history.
-        self.seen.retain(|_, _| false); // Clear every 30s cycle or block end
+        // [BULLETPROOF FIX] Rolling window cleanup to prevent heap bloat.
+        if self.seen.len() > 1000 {
+            self.seen.clear();
+        }
 
         // [MEMORY FIX] Strict behavioral history limit (Last 5 blocks only)
         self.sender_history.retain(|_, (block, _, _, _)| {
@@ -417,26 +418,30 @@ impl SharedState {
     pub fn refresh_path_cache(&self) {
         // Pillar C: Multi-Core Coverage - Cache paths for all major Base assets
         let core_tokens: Vec<Address> = self.config.important_tokens.iter().cloned().collect();
-        // [MEMORY FIX] We only need the index, removing all_cycles to save 50% Path memory
-        // let mut all_cycles: Vec<Path> = Vec::new(); 
 
         // Ensure graph data is synced before pathfinding
         self.graph.rebuild_optimized();
         let mut index: FxHashMap<Address, Vec<Arc<Path>>> = FxHashMap::default();
+        let mut total_cycles = 0;
 
         for token in core_tokens {
             let cycles = self.graph.find_cycles(token, self.config.max_path_length);
             for cycle in cycles {
+                if total_cycles > 5000 { break; } // [BULLETPROOF] Absolute limit on cached paths
                 let arc_path = Arc::new(cycle.clone());
-                // Index by the token that triggers this cycle (the first hop's token_in)
                 index.entry(arc_path.hops[0].token_in).or_default().push(arc_path);
+                total_cycles += 1;
             }
+            if total_cycles > 5000 { break; }
         }
 
-        // Create a flat list for the global path cache only from the unique index entries
-        let flat_cycles: Vec<Path> = index.values()
-            .flat_map(|v| v.iter().map(|p| (**p).clone()))
-            .collect();
+        // [OPTIMIZATION] Avoid full cloning of Paths for the global cache
+        let mut flat_cycles = Vec::with_capacity(total_cycles);
+        for paths in index.values() {
+            for p in paths {
+                flat_cycles.push((**p).clone());
+            }
+        }
 
         let mut active_pools = FxHashSet::default();
         for path in &flat_cycles {

@@ -380,8 +380,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         chain,
         min_gas_price_gwei: 0, // Base L2: capture all txs
         sequencer_endpoint: sequencer_endpoint.clone(),
-        worker_count: 32,      // Pillar A: Goli ki Raftaar (Processing speed doubled)
-        fetcher_count: 32,     // Pillar A: Concurrent fetching increased
+        worker_count: 8,
+        fetcher_count: 8,
         ..Default::default()
     }).await?;
 
