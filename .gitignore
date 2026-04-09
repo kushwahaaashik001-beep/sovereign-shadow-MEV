@@ -1,0 +1,32 @@
+# --- RUST JUNK (The big stuff) ---
+/target/
+target/
+**/*.rs.bk
+
+# --- DATA & LOGS (GitHub 100MB limit fix) ---
+*.log
+*.csv
+logs/
+data/
+temp/
+
+# --- SMART CONTRACTS (Foundry/Solidity) ---
+out/
+cache/
+broadcast/
+
+# --- SECRETS & CONFIG ---
+.env
+*.env
+.pvt
+
+# --- NODE/SYSTEM JUNK ---
+node_modules/
+.DS_Store
+Thumbs.db
+
+# --- LOCAL DOCS (Laptop only) ---
+TODO.md
+MISSION_CONTROL.md
+.instructions.md
+ARCHITECT_STATE.md
