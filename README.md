@@ -1,4 +1,12 @@
 # The Sovereign Shadow — MEV Engine
+---
+title: The Sovereign Shadow
+emoji: ⚡
+colorFrom: black
+colorTo: gray
+sdk: docker
+pinned: false
+---
 
 ## Tech Status: ✅ 100% READY
 
