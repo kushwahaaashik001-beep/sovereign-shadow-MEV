@@ -1,41 +1,51 @@
-# Stage 1: Build (Performance Optimized)
-FROM rust:1.88-slim-bookworm as builder
+# Stage 1: Build stage
+FROM rust:1.88-bookworm as builder
 
-# Build dependencies install karo (SSL aur arithmetic libs ke liye)
+# Saare possible tools jo blockchain crates ko chahiye hote hain
 RUN apt-get update && apt-get install -y \
+    clang \
+    llvm-dev \
+    libclang-dev \
+    cmake \
     pkg-config \
     libssl-dev \
-    cmake \
-    g++ \
+    build-essential \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
+
+# Libclang path set karna zaroori hai c-kzg ke liye
+ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
 
 WORKDIR /usr/src/app
 
-# [OPTIMIZATION] Dependency Caching
-# Isse build time 90% kam ho jayega har code change par
+# Copy Cargo.toml and Cargo.lock first to leverage Docker cache for dependencies.
+# This layer will only be invalidated if these files change.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release
-RUN rm -rf src
 
-# Ab asli source code copy karo
+# Create a dummy src/main.rs to allow `cargo check` to run and cache dependencies.
+# This step will download and compile all dependencies without building the main application.
+RUN mkdir -p src && \
+    echo "fn main() { println!(\"Caching dependencies...\"); }" > src/main.rs && \
+    cargo check --release && \
+    rm src/main.rs
+
+# Copy the rest of the application source code. This layer is invalidated if source code changes.
 COPY . .
 
-# Dummy build ko remove karke asli build start karo
-RUN touch src/main.rs && cargo build --release
+# Build the release binary for your project. This will use the cached dependencies.
+RUN cargo build --release --bin the-sovereign-shadow
 
-# Stage 2: Runtime (Ultra-Lightweight for Speed)
+# Stage 2: Final Light image
 FROM debian:bookworm-slim
 
-# Runtime environment setup
+# Runtime libraries install karo
 RUN apt-get update && apt-get install -y \
-    libssl3 \
+    libssl-dev \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Builder stage se binary copy karo
-COPY --from=builder /usr/src/app/target/release/the-sovereign-shadow /usr/local/bin/sovereign-shadow
-RUN chmod +x /usr/local/bin/sovereign-shadow
+# Binary copy karo (Check karna binary ka naam 'the-sovereign-shadow' hi hai na)
+COPY --from=builder /usr/src/app/target/release/the-sovereign-shadow /usr/local/bin/bot
 
-# Bot start karne ki command
-CMD ["sovereign-shadow"]
+# Bot start command
+CMD ["bot"]
