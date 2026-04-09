@@ -1,5 +1,5 @@
 # Stage 1: Build (Performance Optimized)
-FROM rust:1.85-slim-bookworm as builder
+FROM rust:1.88-slim-bookworm as builder
 
 # Build dependencies install karo (SSL aur arithmetic libs ke liye)
 RUN apt-get update && apt-get install -y \
