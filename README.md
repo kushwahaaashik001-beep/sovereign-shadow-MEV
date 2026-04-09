@@ -1,7 +1,7 @@
 ---
 title: The Sovereign Shadow
 emoji: ⚡
-colorFrom: black
+colorFrom: gray
 colorTo: gray
 sdk: docker
 pinned: false
