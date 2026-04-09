@@ -350,8 +350,8 @@ pub const MAX_NODE_LAG_SECONDS: u64 = 2; // Pillar T: Tightened for L2 (Base/Arb
 // -----------------------------------------------------------------------------
 // Pillar U: The Unseen Host – Zero‑Cost Infrastructure
 // -----------------------------------------------------------------------------
-pub const MAX_POOL_CACHE_SIZE: usize = 10_000;
-pub const MAX_TOKEN_CACHE_SIZE: usize = 2_000;
+pub const MAX_POOL_CACHE_SIZE: usize = 5_000; // Optimized for 16Gi RAM
+pub const MAX_TOKEN_CACHE_SIZE: usize = 1_000;
 
 // -----------------------------------------------------------------------------
 // Pillar V: The Veto Protocol – Dynamic Kill‑Switch

@@ -16,7 +16,7 @@ use crate::v3_math;
 use crate::rpc_manager::RpcManager;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-pub const MULTICALL_BATCH_SIZE: usize = 50; // Increased to 50 for Alchemy CU efficiency
+pub const MULTICALL_BATCH_SIZE: usize = 100; // Even larger batches to reduce RPC overhead
 const MULTICALL_RETRIES: usize = 2;
 
 #[derive(Clone, Debug)]
@@ -568,14 +568,14 @@ impl StateMirror {
         });
 
         // 2. Capacity Guard: Respecting Pillar U (8GB RAM target)
-        if self.pools.len() > crate::constants::MAX_POOL_CACHE_SIZE {
+        if self.pools.len() > 5000 { // [MEMORY FIX] Lower threshold for 16Gi RAM
             warn!("🛡️ [PILLAR U] Pool cache overflow ({}). Evicting least active pools.", self.pools.len());
             // Keep only pools updated in the last 10 blocks to reclaim memory instantly
             self.pools.retain(|_, p| current_block.saturating_sub(p.last_updated_block) < 10);
         }
 
         // 3. Bytecode Pruning: Remove bytecodes for inactive pools to save RAM
-        if self.bytecodes.len() > crate::constants::MAX_TOKEN_CACHE_SIZE {
+        if self.bytecodes.len() > 1000 { // [MEMORY FIX] Strict bytecode limit
             self.bytecodes.retain(|addr, _| self.pools.contains_key(addr));
         }
     }

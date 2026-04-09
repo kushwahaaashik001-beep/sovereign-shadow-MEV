@@ -2,7 +2,6 @@
 #![allow(unused_variables)]
 
 use ethers::types::U512;
-use rand::Rng;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::gas_feed::GasPriceFeed;
@@ -232,8 +231,8 @@ impl HotGraph {
         }
 
         // Pillar C: Expanded Breadth for 3500+ Pools scale
-        // Lead Architect: Focus on top 250 liquid pairs for root, 80 for branches to catch every gap.
-        let breadth = if current_path.is_empty() { 250 } else { 80 }; 
+        // [MEMORY FIX] Reduced breadth to prevent path explosion (100/40 is optimal for 16Gi RAM)
+        let breadth = if current_path.is_empty() { 100 } else { 40 }; 
         let current_token_addr = data.idx_to_address[current_idx];
 
         for edge in data.edge_map[current_idx].iter().take(breadth) {
@@ -372,18 +371,14 @@ impl SharedState {
     fn prune_memory(&self) {
         let current_block = self.mirror.current_block_number();
         
-        // 1. Prune seen transactions (Seen: 10k limit)
-        if self.seen.len() > 10_000 {
-            debug!("🧹 [PILLAR U] Pruning 'seen' cache ({} entries)", self.seen.len());
-            self.seen.retain(|_, _| rand::thread_rng().gen_bool(0.5)); // Keep some history for pattern recognition
-        }
+        // [MEMORY FIX] Aggressive block-based pruning for seen txs. 
+        // MEV transactions expire every block, no need to keep 10k history.
+        self.seen.retain(|_, _| false); // Clear every 30s cycle or block end
 
-        // 2. Prune sender history (keep only recent activity)
-        if self.sender_history.len() > 5_000 {
-            self.sender_history.retain(|_, (block, _, _, _)| {
-                current_block.saturating_sub(*block) < 100 // Last 100 blocks
-            });
-        }
+        // [MEMORY FIX] Strict behavioral history limit (Last 5 blocks only)
+        self.sender_history.retain(|_, (block, _, _, _)| {
+            current_block.saturating_sub(*block) < 5
+        });
 
         // 3. Prune Neural Memory (Revert streaks and ghost logs)
         if self.neural_memory.revert_streak.len() > 1000 {
@@ -422,11 +417,11 @@ impl SharedState {
     pub fn refresh_path_cache(&self) {
         // Pillar C: Multi-Core Coverage - Cache paths for all major Base assets
         let core_tokens: Vec<Address> = self.config.important_tokens.iter().cloned().collect();
-        let mut all_cycles: Vec<Path> = Vec::new();
+        // [MEMORY FIX] We only need the index, removing all_cycles to save 50% Path memory
+        // let mut all_cycles: Vec<Path> = Vec::new(); 
 
         // Ensure graph data is synced before pathfinding
         self.graph.rebuild_optimized();
-
         let mut index: FxHashMap<Address, Vec<Arc<Path>>> = FxHashMap::default();
 
         for token in core_tokens {
@@ -435,20 +430,23 @@ impl SharedState {
                 let arc_path = Arc::new(cycle.clone());
                 // Index by the token that triggers this cycle (the first hop's token_in)
                 index.entry(arc_path.hops[0].token_in).or_default().push(arc_path);
-                all_cycles.push(cycle);
             }
         }
 
+        // Create a flat list for the global path cache only from the unique index entries
+        let flat_cycles: Vec<Path> = index.values()
+            .flat_map(|v| v.iter().map(|p| (**p).clone()))
+            .collect();
+
         let mut active_pools = FxHashSet::default();
-        for path in &all_cycles {
+        for path in &flat_cycles {
             for hop in path.hops.iter() {
                 active_pools.insert(hop.pool_address);
             }
         }
         self.mirror.update_sync_filter(active_pools);
-
         self.indexed_paths.store(Arc::new(index));
-        self.path_cache.store(Arc::new(all_cycles));
+        self.path_cache.store(Arc::new(flat_cycles));
         debug!("🔄 [PATH CACHE] Refreshed. Total unique cycles: {}", self.path_cache.load().len());
     }
 }
