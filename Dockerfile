@@ -17,23 +17,10 @@ RUN apt-get update && apt-get install -y \
 ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
 
 WORKDIR /usr/src/app
-
-# Copy Cargo.toml and Cargo.lock first to leverage Docker cache for dependencies.
-# This layer will only be invalidated if these files change.
-COPY Cargo.toml Cargo.lock ./
-
-# Create a dummy src/main.rs to allow `cargo check` to run and cache dependencies.
-# This step will download and compile all dependencies without building the main application.
-RUN mkdir -p src && \
-    echo "fn main() { println!(\"Caching dependencies...\"); }" > src/main.rs && \
-    cargo check --release && \
-    rm src/main.rs
-
-# Copy the rest of the application source code. This layer is invalidated if source code changes.
 COPY . .
 
-# Build the release binary for your project. This will use the cached dependencies.
-RUN cargo build --release --bin the-sovereign-shadow
+# Build the release binary
+RUN cargo build --release
 
 # Stage 2: Final Light image
 FROM debian:bookworm-slim
