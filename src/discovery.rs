@@ -37,12 +37,14 @@ pub async fn sync_initial_pools(
     limit: usize,
 ) -> Result<()> {
     if v2_factory.is_zero() && aero_factory.is_zero() { return Ok(()); }
-    info!("🌊 [ZENITH] Starting Pool Bootstrap using {} RPC keys. (Limit: {})", rpc_manager.provider_count(), limit);
+    info!("🌊 [ZENITH] Bootstrapping {} RPC keys. (Limit: {})", rpc_manager.provider_count(), limit);
     let shared_count = Arc::new(AtomicUsize::new(0));
 
     // 1. Sync Uniswap V2 Pairs
-    if let Err(e) = fetch_and_dispatch(rpc_manager.clone(), &pool_tx, v2_factory, "allPairs", limit, shared_count.clone()).await {
-        warn!("⚠️ V2 Factory sync failed: {}. Check factory address and RPC health.", e);
+    if !v2_factory.is_zero() {
+        if let Err(e) = fetch_and_dispatch(rpc_manager.clone(), &pool_tx, v2_factory, "allPairs", limit, shared_count.clone()).await {
+            warn!("⚠️ V2 Factory sync failed: {}. Skipping...", e);
+        }
     }
     // 2. Sync Aerodrome Pools
     if !aero_factory.is_zero() {
@@ -194,10 +196,12 @@ async fn fetch_and_dispatch(
                 for (pool_addr, (token_0, token_1)) in pool_data {
                     if count.load(Ordering::Relaxed) >= limit { break; }
 
-                    // Pillar Z: Core Token Filter - Only accept pools with high-liquidity assets
-                    let has_core = crate::constants::CORE_TOKENS.contains(&token_0) || crate::constants::CORE_TOKENS.contains(&token_1);
+                    // Pillar Z: Broadened Filter - Accept pools with any high-liquidity assets (AERO, DEGEN, etc.)
+                    let chain = Chain::Base; 
+                    let is_safe = crate::constants::SAFE_TOKENS.get(&chain)
+                        .map_or(false, |set| set.contains(&token_0) || set.contains(&token_1));
 
-                    if !token_0.is_zero() && !token_1.is_zero() && has_core {
+                    if !token_0.is_zero() && !token_1.is_zero() && is_safe {
                         let dex_name = if method == "allPairs" { DexName::UniswapV2 } else { DexName::Aerodrome };
                         let _ = tx.send(NewPoolEvent::V2(V2PoolData { pair: pool_addr, token_0, token_1, dex_name }));
                         count.fetch_add(1, Ordering::Relaxed);

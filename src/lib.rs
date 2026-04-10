@@ -29,3 +29,21 @@ pub mod v3_math;
 pub use models::*;
 pub use utils::*;
 pub use state_mirror::{StateMirror, GasState, PoolState};
+
+use ethers::providers::{Provider, Ws};
+use std::sync::Arc;
+
+pub struct WsProviderPool {
+    pub providers: Vec<Arc<Provider<Ws>>>,
+    pub next:      std::sync::atomic::AtomicUsize,
+}
+
+impl WsProviderPool {
+    pub fn new(providers: Vec<Arc<Provider<Ws>>>) -> Self {
+        Self { providers, next: std::sync::atomic::AtomicUsize::new(0) }
+    }
+    pub fn next(&self) -> Arc<Provider<Ws>> {
+        let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.providers.len();
+        self.providers[idx].clone()
+    }
+}

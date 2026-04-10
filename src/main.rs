@@ -34,7 +34,9 @@ use tokio::sync::{broadcast, mpsc};
 use std::env;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, filter::LevelFilter};
-use tokio::io::AsyncWriteExt;
+use tokio::io::AsyncWriteExt; // Keep this, it's used for the HF health check
+
+use the_sovereign_shadow::WsProviderPool;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -207,13 +209,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     })?;
     let ws_provider = Arc::new(ws_provider);
 
+    // Create a pool of WSS providers for block listener and factory scanner
+    let mut ws_providers_for_pool = Vec::new();
+    for url in &wss_urls {
+        if let Ok(p) = Provider::<Ws>::connect(url).await {
+            ws_providers_for_pool.push(Arc::new(p));
+        }
+    }
+    let ws_provider_pool = Arc::new(WsProviderPool::new(ws_providers_for_pool));
+
     // ── HTTP Provider Manager (Round-Robin for Rate Limit Avoidance) ──────────
     let http_rpc_manager = Arc::new(RpcManager::new(http_urls));
     
     let chain_id = ws_provider.get_chainid().await?.as_u64();
 
     // ── Wallet ────────────────────────────────────────────────────────────────
-    let wallet = LocalWallet::from_str(priv_key).map_err(|e| {
+    let wallet = LocalWallet::from_str(priv_key).map_err(|e| { // Use `priv_key` directly
         error!("FATAL: Private Key parsing failed. Check SHADOW_PRIVATE_KEY format in .env");
         e
     })?.with_chain_id(chain_id);
@@ -223,12 +234,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // ── Core infrastructure ───────────────────────────────────────────────────
     // [PILLAR V] Tightened Circuit Breaker for ₹200 Budget
     // Max 3 failures instead of 5, and 60s cooldown to analyze "Why it failed".
-    let circuit_breaker = Arc::new(CircuitBreaker::new(3, 60)); 
-    let l1_fee_calc     = Arc::new(L1DataFeeCalculator::new(http_rpc_manager.get_next_provider()));
-    let gas_feed        = Arc::new(GasPriceFeed::new(ws_provider.clone(), chain).await);
+    let circuit_breaker = Arc::new(CircuitBreaker::new(3, 60));
+    let l1_fee_calc     = Arc::new(L1DataFeeCalculator::new(http_rpc_manager.get_next_provider())); // This still uses HTTP provider
+    let gas_feed        = Arc::new(GasPriceFeed::new(ws_provider_pool.clone(), chain).await); // [FIX] Use WsProviderPool here
 
     // Multicall3 — same address on all chains
-    let multicall3: Address = "0xcA11bde05977b3631167028862bE2a173976CA11".parse()?;
+    let multicall3: Address = "0xcA11bde05977b3631167028862bE2a173976CA11".parse().expect("Invalid Multicall3 address");
 
     // ── Pillar B: State Mirror ────────────────────────────────────────────────
     let state_mirror = StateMirror::new(ws_provider.clone(), http_rpc_manager.clone(), multicall3);
@@ -240,7 +251,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // ── Pillar Z: Factory Scanner ─────────────────────────────────────────────
     let (pool_tx, _) = broadcast::channel::<NewPoolEvent>(2048);
     {
-        let scanner = Arc::new(FactoryScanner::new(ws_provider.clone(), pool_tx.clone()));
+        let scanner = Arc::new(FactoryScanner::new(ws_provider_pool.clone(), pool_tx.clone(), chain)); // Use WsProviderPool and pass chain
         tokio::spawn(async move { scanner.run().await; });
     }
 
@@ -380,8 +391,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         chain,
         min_gas_price_gwei: 0, // Base L2: capture all txs
         sequencer_endpoint: sequencer_endpoint.clone(),
-        worker_count: 8,
-        fetcher_count: 8,
+        worker_count: 4,
+        fetcher_count: 4,
         ..Default::default()
     }).await?;
 
@@ -415,7 +426,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     detector_config.chain          = chain;
     detector_config.executor_address = executor_address;
     detector_config.bribe_percent  = 50; // Pillar I: Consolidate to 50% across engine
-    detector_config.scanner_threads = 64; // Power increased for more pools
+    detector_config.scanner_threads = 16;
     detector_config.min_profit_wei = U256::from(1u64); // ⚡ 1-WEI SENSITIVITY
     detector_config.pool_limit = bootstrap_count;
 
@@ -446,14 +457,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Block-driven mirror sync (every block) - Link to Detector
     {
-        let mirror   = state_mirror.clone();
-        let provider = ws_provider.clone();
-        let cb       = circuit_breaker.clone();
-        let be       = bidding_engine.clone();
-        let f_tx     = force_tx.clone();
+        let mirror        = state_mirror.clone();
+        let ws_pool_clone = ws_provider_pool.clone(); // Use the WsProviderPool
+        let cb            = circuit_breaker.clone();
+        let be            = bidding_engine.clone();
+        let f_tx          = force_tx.clone();
         tokio::spawn(async move {
             loop {
-                match provider.subscribe_blocks().await {
+                match ws_pool_clone.next().subscribe_blocks().await { // Use next provider from pool
                     Ok(mut stream) => {
                         info!("✅ [PILLAR A] Block stream active.");
                 while let Some(block) = stream.next().await {
@@ -469,6 +480,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                     Err(e) => {
                         error!("❌ [PILLAR A] Block subscription failed: {:?}. Retrying in 5s...", e);
+                        // The loop will automatically try the next provider in the pool on the next iteration
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -533,16 +545,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // Priority 2: Aerodrome (High Alpha on Base)
         if !target_aero_factory.is_zero() {
             info!("🌊 [ZENITH] Bootstrapping Aerodrome (High Priority)...");
-            if let Err(e) = discovery::sync_initial_pools(rpc_manager_clone.clone(), pool_tx_clone.clone(), Address::zero(), target_aero_factory, bootstrap_count).await {
+            if let Err(e) = discovery::sync_initial_pools(rpc_manager_clone.clone(), pool_tx_clone.clone(), Address::zero(), target_aero_factory, bootstrap_count / 2).await { // Distribute total bootstrap count
                 error!("❌ Aerodrome Bootstrap failed: {:?}", e);
             }
         }
 
         // Priority 3: Other V2 Factories (Sushi, BaseSwap, etc.)
         info!("🌊 [ZENITH] Bootstrapping {} V2 factories...", target_v2_factories.len());
+        let per_factory_limit = (bootstrap_count - (bootstrap_count / 2)) / target_v2_factories.len().max(1); // Remaining count divided among V2 factories
         for factory_addr in target_v2_factories {
-            // Use a per-factory limit to ensure variety
-            let per_factory_limit = bootstrap_count / 3; 
+            // [FIX] Balanced distribution to hit overall bootstrap_count target
             if let Err(e) = discovery::sync_initial_pools(rpc_manager_clone.clone(), pool_tx_clone.clone(), factory_addr, Address::zero(), per_factory_limit).await {
                 error!("❌ V2 Bootstrap failed for factory {:?}: {:?}", factory_addr, e);
             }

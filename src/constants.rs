@@ -345,7 +345,7 @@ pub const ENABLE_GASLESS_MODE: bool = false;
 // Pillar T: The Anti‑Drift Guardian – Lag Shield
 // -----------------------------------------------------------------------------
 pub const MAX_STALE_BLOCKS: u64 = 1;
-pub const MAX_NODE_LAG_SECONDS: u64 = 2; // Pillar T: Tightened for L2 (Base/Arb) 2s is safe limit
+pub const MAX_NODE_LAG_SECONDS: u64 = 10; // [FIX] Increased for HF Stability: 10s prevents false-positive lag vetoes
 
 // -----------------------------------------------------------------------------
 // Pillar U: The Unseen Host – Zero‑Cost Infrastructure
@@ -446,8 +446,8 @@ pub const MIN_PROFIT_BPS: u64 = 5;
 pub const DEFAULT_SLIPPAGE_BPS: u64 = 30; // 0.3%
 pub const GAS_LIMIT_MULTIPLIER: f64 = 1.15;
 pub const PRIORITY_FEE_MULTIPLIER: f64 = 1.2;
-pub const MAX_GAS_PRICE_GWEI: u64 = 50; // Allow more room during spikes
-pub const MAX_TOTAL_TX_FEE_WEI: u128 = 20_000_000_000_000; // ₹15-20 max per trade attempt
+pub const MAX_GAS_PRICE_GWEI: u64 = 100; // [FIX] Allow more room for execution during volatility
+pub const MAX_TOTAL_TX_FEE_WEI: u128 = 100_000_000_000_000; // [FIX] 0.0001 ETH (~$0.26) max per trade attempt for Base L2
 pub const STRIKE_GAS_LIMIT: u64 = 150_000; // Even tighter gas limit for Base
 pub const MIN_SEARCHER_BALANCE_WEI: u128 = 200_000_000_000_000; // 🛡️ Safety Floor: Stop at ₹40-50 to avoid total depletion
 pub const SURVIVAL_PROFIT_MULTIPLIER: u64 = 2; // ⚡ Predator Selectivity: Must be 2x Cost during bootstrap

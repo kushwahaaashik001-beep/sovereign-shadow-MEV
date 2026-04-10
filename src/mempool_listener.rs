@@ -170,8 +170,14 @@ impl MempoolListener {
         let base_fee_cache = Arc::new(BaseFeeCache::new());
 
         let mut stream_selector = SelectAll::new();
-        let stream = Self::create_block_tx_stream(provider_pool.next(), config.fetcher_count).await?;
-        stream_selector.push(stream);
+        // [FIX] Subscribe using all providers in the pool for maximum redundancy and initial setup
+        // This loop is for initial setup. The `run` loop's `else` branch will handle reconnections.
+        // We clone `provider_pool.providers` to avoid holding a mutable reference across await points if `provider_pool.next()` was used.
+        for provider in provider_pool.providers.iter() {
+            if let Ok(stream) = Self::create_block_tx_stream(provider.clone(), config.fetcher_count).await {
+                stream_selector.push(stream);
+            }
+        }
 
         let mut worker_txs = Vec::with_capacity(config.worker_count);
         let mut worker_rxs = Vec::with_capacity(config.worker_count);
@@ -312,12 +318,15 @@ impl MempoolListener {
                 }
                 else => {
                     warn!("All streams ended, reconnecting...");
-                    time::sleep(Duration::from_secs(1)).await;
-                    if let Ok(stream) = Self::create_block_tx_stream(
-                        self.provider_pool.next(), self.config.fetcher_count
-                    ).await {
-                        self.stream_selector.push(stream);
-                        self.stats.reconnects.fetch_add(1, Ordering::Relaxed);
+                    // [FIX] Clear existing streams and re-subscribe to ALL providers in the pool
+                    // This ensures all available WSS connections are re-attempted.
+                    self.stream_selector = SelectAll::new(); // Clear all previous streams
+                    for provider in self.provider_pool.providers.iter() {
+                        time::sleep(Duration::from_millis(100)).await; // Small delay to avoid hammering RPCs
+                        if let Ok(stream) = Self::create_block_tx_stream(provider.clone(), self.config.fetcher_count).await {
+                            self.stream_selector.push(stream);
+                            self.stats.reconnects.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }

@@ -5,9 +5,7 @@
 // =============================================================================
 
 use ethers::{
-    prelude::*,
-    providers::{Provider, Ws},
-    types::{Address, U256, transaction::eip2718::TypedTransaction},
+    prelude::*, types::{Address, U256, transaction::eip2718::TypedTransaction},
 };
 use std::str::FromStr;
 use std::sync::Arc;
@@ -23,47 +21,53 @@ pub struct GasPriceFeed {
 
 impl GasPriceFeed {
     /// Creates a new feed and spawns a background task to keep it updated.
-    pub async fn new(provider: Arc<Provider<Ws>>, chain: Chain) -> Self {
+    pub async fn new(ws_provider_pool: Arc<crate::WsProviderPool>, chain: Chain) -> Self { // Use WsProviderPool
         let (base_tx, base_rx) = watch::channel(U256::zero());
         let (priority_tx, priority_rx) = watch::channel(U256::zero());
         let (l1_tx, l1_rx) = watch::channel(U256::zero());
 
-        let provider_clone = provider.clone();
+        let ws_pool_clone = ws_provider_pool.clone();
         tokio::spawn(async move {
-            let mut stream = match provider_clone.subscribe_blocks().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("Failed to subscribe to blocks for gas feed: {}", e);
-                    return;
-                }
-            };
+            loop {
+                let provider = ws_pool_clone.next(); // Get next provider from the pool
+                let mut stream: SubscriptionStream<'_, Ws, Block<H256>> = match provider.subscribe_blocks().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("Failed to subscribe to blocks for gas feed: {}. Retrying with next provider.", e);
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
 
-            while let Some(block) = stream.next().await {
-                let base = block.base_fee_per_gas;
-                if let Some(b) = base {
-                    let effective_base = if b.is_zero() { U256::from(100_000u64) } else { b };
-                    let _ = base_tx.send(effective_base);
-                }
-                if let Ok(fee) = provider_clone.request::<(), U256>("eth_maxPriorityFeePerGas", ()).await {
-                    let effective = if fee.is_zero() {
-                        base.unwrap_or_default() / U256::from(10)
-                    } else { fee };
-                    let _ = priority_tx.send(effective.max(U256::from(100_000u64)));
-                } else if let Some(b) = base {
-                    let _ = priority_tx.send((b / U256::from(10)).max(U256::from(100_000u64)));
-                }
+                while let Some(block) = stream.next().await {
+                    let base: Option<U256> = block.base_fee_per_gas;
+                    if let Some(b) = base {
+                        let effective_base = if b.is_zero() { U256::from(100_000u64) } else { b };
+                        let _ = base_tx.send(effective_base);
+                    }
+                    if let Ok(fee) = provider.request::<(), U256>("eth_maxPriorityFeePerGas", ()).await {
+                        let effective = if fee.is_zero() {
+                            base.unwrap_or_default() / U256::from(10)
+                        } else { fee };
+                        let _ = priority_tx.send(effective.max(U256::from(100_000u64)));
+                    } else if let Some(b_val) = base {
+                        let _ = priority_tx.send((b_val / U256::from(10)).max(U256::from(100_000u64)));
+                    }
 
-                // For L2s, fetch L1 base fee estimate.
-                if chain == Chain::Optimism || chain == Chain::Base {
-                    let oracle = Address::from_str("0x420000000000000000000000000000000000000F").unwrap();
-                    let selector = &ethers::utils::keccak256(b"l1BaseFee()")[..4];
-                    let tx: TypedTransaction = TransactionRequest::new().to(oracle).data(selector.to_vec()).into();
-                    if let Ok(l1_base_fee_res) = provider_clone.call(&tx, None).await {
-                        let fee = U256::from_big_endian(&l1_base_fee_res);
-                        let _ = l1_tx.send(fee);
+                    // For L2s, fetch L1 base fee estimate.
+                    if chain == Chain::Optimism || chain == Chain::Base {
+                        let oracle = Address::from_str("0x420000000000000000000000000000000000000F").unwrap();
+                        let selector = &ethers::utils::keccak256(b"l1BaseFee()")[..4];
+                        let tx: TypedTransaction = TransactionRequest::new().to(oracle).data(selector.to_vec()).into();
+                        if let Ok(res) = provider.call(&tx, None).await {
+                            let fee = U256::from_big_endian(&res);
+                            let _ = l1_tx.send(fee);
+                        }
                     }
                 }
-            }
+                tracing::error!("Gas feed block stream ended unexpectedly. Retrying with next provider.");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            };
         });
 
         Self {

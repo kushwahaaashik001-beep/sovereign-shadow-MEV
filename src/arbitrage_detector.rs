@@ -472,7 +472,7 @@ impl ArbitrageDetector {
     pub async fn new(
         config:       DetectorConfig,
         provider:     Arc<Provider<Ws>>,
-        state_mirror: Arc<StateMirror>,
+        state_mirror: Arc<StateMirror>, // This is still the single ws_provider, but it's okay for state_mirror
         gas_feed:     Arc<GasPriceFeed>,
         bidding_engine: Arc<BiddingEngine>,
         event_rx:     mpsc::Receiver<super::mempool_listener::SwapEvent>,
@@ -975,7 +975,7 @@ impl ArbitrageDetector {
 
         let max_gas = match state.config.chain {
             Chain::Mainnet => U256::from(500_000_000_000u64), // 500 Gwei
-            _              => U256::from(1_000_000_000u64),   // 1 Gwei (Safe limit for ₹200 budget)
+            _              => U256::from(10_000_000_000u64),  // [FIX] 10 Gwei - allows trading during small Base spikes
         };
 
         // Pillar Q: Bootstrap Shield - Emergency Gas Veto
