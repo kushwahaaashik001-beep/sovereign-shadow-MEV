@@ -128,7 +128,7 @@ async fn fetch_and_dispatch(
                 }
             }
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await; // Safer throttle for 3500+ pools
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await; // [BULLETPROOF] Heavy throttle for Discovery
     }
 
     // Multicall ABI for aggregate3

@@ -31,7 +31,7 @@ impl RpcManager {
             urls,
             index: AtomicUsize::new(0),
             cooldowns: DashMap::new(),
-            backoff_duration: Duration::from_secs(2), // Initial cooldown period
+            backoff_duration: Duration::from_secs(5), // [BULLETPROOF] Increased cooldown for HF stability
         }
     }
 

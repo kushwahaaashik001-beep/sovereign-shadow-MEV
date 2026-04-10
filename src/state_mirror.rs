@@ -4,7 +4,6 @@ use revm::primitives::Bytecode;
 use crate::bindings::IUniswapV3Pool;
 use ethers::abi::{self, Token};
 use ethers::utils::hex;
-use futures::future::join_all;
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,7 +15,7 @@ use crate::v3_math;
 use crate::rpc_manager::RpcManager;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-pub const MULTICALL_BATCH_SIZE: usize = 40; // [HF FIX] Smaller batches prevent huge RAM spikes during decoding
+pub const MULTICALL_BATCH_SIZE: usize = 30; // [BULLETPROOF] Smaller batches for free-tier RPCs
 const MULTICALL_RETRIES: usize = 2;
 
 #[derive(Clone, Debug)]
@@ -223,7 +222,6 @@ impl StateMirror {
         if self.pools.is_empty() { return; }
         let start = Instant::now();
         let (all_calls, call_tracking) = self.build_multicall_calls();
-        let mut tasks = Vec::new();
         for chunk_start in (0..all_calls.len()).step_by(MULTICALL_BATCH_SIZE) {
             let chunk_end = (chunk_start + MULTICALL_BATCH_SIZE).min(all_calls.len());
             let calls_chunk = Arc::new(all_calls[chunk_start..chunk_end].to_vec());
@@ -234,21 +232,17 @@ impl StateMirror {
             let multicall_address = self.multicall_address;
             let current_block = self.current_block.clone();
 
-            tasks.push(tokio::spawn(async move {
-                for attempt in 0..MULTICALL_RETRIES {
-                    match Self::execute_multicall_raw(provider.clone(), multicall_address, calls_chunk.as_slice(), tracking_chunk.as_slice(), &pools, current_block.load(Ordering::Acquire)).await {
-                        Ok(_) => break,
-                        Err(e) => {
-                            warn!("[RADAR] chunk fail {}/{}: {}", attempt+1, MULTICALL_RETRIES, e);
-                            if attempt + 1 < MULTICALL_RETRIES {
-                                tokio::time::sleep(std::time::Duration::from_millis(10)).await; // Reduced delay for faster recovery
-                            }
-                        }
+            // [BULLETPROOF] Sequential execution with delay to prevent 429 Rate Limits
+            for attempt in 0..MULTICALL_RETRIES {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; 
+                match Self::execute_multicall_raw(provider.clone(), multicall_address, calls_chunk.as_slice(), tracking_chunk.as_slice(), &pools, current_block.load(Ordering::Acquire)).await {
+                    Ok(_) => break,
+                    Err(e) => {
+                        warn!("[RADAR] chunk fail {}/{}: {}", attempt+1, MULTICALL_RETRIES, e);
                     }
                 }
-            }));
+            }
         }
-        join_all(tasks).await;
         debug!("⚡ [SYNC] {} Pools Synced in {:?}", self.pools.len(), start.elapsed());
     }
 
@@ -411,8 +405,8 @@ impl StateMirror {
         for entry in self.pools.iter() {
             let (addr, state) = entry.pair();
 
-            // Sync ALL registered pools — selective filter was causing Opps:0
-        // let _ = &filter; // filter disabled intentionally
+            // [FIX] Selective Sync: Only update pools that are part of active cycles
+            if !filter.is_empty() && !filter.contains(addr) { continue; }
 
             // [LOGIC PURGE] Skip poisoned pools instantly
             if self.poisoned_accounts.contains_key(addr) { continue; }

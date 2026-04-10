@@ -472,6 +472,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     mirror.mark_dirty();
                     if block_num % 100 == 0 { mirror.prune_stale_pools(500); }
                     be.reset_pressure();
+                    tokio::time::sleep(Duration::from_millis(200)).await; // Delay to let RPC state catch up
                     mirror.sync(Some(block.clone())).await;
                     let _ = f_tx.send(()); // Zero-latency snapshot trigger
                     cb.record_sequencer_drift(block.timestamp.as_u64());
