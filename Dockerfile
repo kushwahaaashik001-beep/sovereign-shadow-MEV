@@ -19,10 +19,16 @@ COPY . .
 # We force them to the last stable versions compatible with Rust 1.85.
 RUN cargo update -p serde_with --precise 3.11.0 || true && \
     cargo update -p serde_with_macros --precise 3.11.0 || true && \
+    cargo update -p icu_provider --precise 1.5.0 || true && \
+    cargo update -p icu_locid --precise 1.5.0 || true && \
+    cargo update -p icu_locid_transform --precise 1.5.0 || true && \
+    cargo update -p icu_normalizer --precise 1.5.0 || true && \
     cargo update -p icu_normalizer_data --precise 1.5.0 || true && \
     cargo update -p icu_properties --precise 1.5.0 || true && \
     cargo update -p icu_properties_data --precise 1.5.0 || true && \
-    cargo update -p icu_provider --precise 1.5.0 || true
+    cargo update -p icu_collections --precise 1.5.0 || true && \
+    cargo update -p toml_edit --precise 0.22.22 || true && \
+    cargo update -p hashbrown --precise 0.14.5 || true
 
 # Build with memory limits to prevent Hugging Face OOM
 ENV PROTOC_NO_VENDOR=1
