@@ -1,5 +1,5 @@
 # --- STAGE 1: BUILD ENGINE ---
-FROM rust:1.85-slim-bookworm AS builder
+FROM rust:latest AS builder
 
 # Install build-essential tools for high-performance crates (secp2k1, alloy)
 RUN apt-get update && apt-get install -y \
