@@ -16,9 +16,10 @@ COPY . .
 
 # Pillar HF Optimization: Limit parallel jobs to prevent OOM (Out of Memory)
 # We also ensure protoc can find the proto files
+ENV PROTOC=/usr/bin/protoc
 ENV PROTOC_NO_VENDOR=1
 RUN CARGO_NET_GIT_FETCH_WITH_CLI=true \
-    cargo build --release --jobs 2
+    cargo build --release --jobs 1
 
 
 # --- STAGE 2: THE FORTRESS RUNTIME ---
