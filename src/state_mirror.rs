@@ -345,10 +345,10 @@ impl StateMirror {
             // If last_updated is 0, it means it's a freshly discovered pool but never traded.
             // We give it a 100 block grace period before purging.
             let age = if pool.last_updated_block == 0 { 0 } else { current.saturating_sub(pool.last_updated_block) };
-            age <= max_age_blocks
+            age <= max_age_blocks && pool.reserves0 > U256::ZERO // Remove empty pools
         });
-        if self.pools.len() > 3000 {
-            self.pools.retain(|_, p| current.saturating_sub(p.last_updated_block) < 10);
+        if self.pools.len() > 2500 { // Stricter limit for Hugging Face RAM
+            self.pools.retain(|_, p| current.saturating_sub(p.last_updated_block) < 5);
         }
         if self.bytecodes.len() > 500 {
             self.bytecodes.retain(|addr, _| self.pools.contains_key(addr));

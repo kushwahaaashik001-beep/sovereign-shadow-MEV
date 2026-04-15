@@ -213,11 +213,11 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
             // Initial heavy sync
             let _ = mirror_sync.sync_all_pools_multicall(provider_sync.clone()).await;
             
-            let mut interval = tokio::time::interval(Duration::from_secs(4)); // Every ~2 blocks on Base
+            let mut interval = tokio::time::interval(Duration::from_secs(60)); // RELAXED: Sync once per minute
             loop {
                 interval.tick().await;
                 if let Err(e) = mirror_sync.sync_all_pools_multicall(provider_sync.clone()).await {
-                    error!("❌ [STATE SYNC] Multicall batch sync failed: {}", e);
+                    warn!("🔄 [STATE SYNC] Background sync skipped/failed (RPC limit protection): {}", e);
                 }
             }
         });
@@ -316,7 +316,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
         discovery.warm_start().await;
     }
 
-    // Pillar Q: Bootstrap Protocol (Final Pre-flight)
+    // Pillar Q: Bootstrap Protocol (Minimal RPC calls)
     info!("🛠️ [PILLAR Q] Executing Bootstrap Protocol...");
     {
         // 1. Check Survival Budget
@@ -330,7 +330,6 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
         let _ = ws_provider.get_block_number().await?;
         let latency = start.elapsed().as_millis();
         info!("📡 [BOOTSTRAP] RPC Latency: {}ms", latency);
-        if latency > 500 { warn!("⚠️ [BOOTSTRAP] High latency detected on primary RPC!"); }
     }
     info!("✅ [PILLAR Q] Bootstrap Sequence Complete. System is STABLE.");
 

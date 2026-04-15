@@ -129,8 +129,7 @@ impl FactoryScanner {
             let token_0 = Address::from_word(topics[1]);
             let token_1 = Address::from_word(topics[2]);
             let data = log.data().data.as_ref();
-            if data.len() < 32 { return None; }
-            let pair = Address::from_word(B256::from_slice(&data[0..32]));
+            let pair = Address::from_slice(data.get(12..32)?);
 
             return Some(NewPoolEvent::V2(V2PoolData {
                 pair, token_0, token_1, dex_name: *dex_name,
@@ -143,7 +142,8 @@ impl FactoryScanner {
             let token_0 = Address::from_word(topics[1]);
             let token_1 = Address::from_word(topics[2]);
             let _is_stable = topics[3] != B256::ZERO;
-            let pool = Address::from_word(B256::from_slice(&log.data().data[12..32]));
+            let data = log.data().data.as_ref();
+            let pool = Address::from_slice(data.get(12..32)?);
 
             return Some(NewPoolEvent::V2(V2PoolData {
                 pair: pool, token_0, token_1, dex_name: DexName::Aerodrome,
@@ -158,8 +158,7 @@ impl FactoryScanner {
             let fee = u32::from_be_bytes([0, topics[3][29], topics[3][30], topics[3][31]]);
             
             let data = log.data().data.as_ref();
-            if data.len() < 64 { return None; }
-            let pool = Address::from_word(B256::from_slice(&data[32..64]));
+            let pool = Address::from_slice(data.get(44..64)?);
 
             return Some(NewPoolEvent::V3(V3PoolData {
                 pool, token_0, token_1, fee, dex_name: *dex_name,

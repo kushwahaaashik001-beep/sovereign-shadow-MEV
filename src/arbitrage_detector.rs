@@ -10,6 +10,7 @@ use tracing::{info, debug};
 use rustc_hash::FxHasher;
 use std::hash::BuildHasherDefault;
 use arc_swap::ArcSwap;
+use tokio::time::{self, Duration};
 use dashmap::DashMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use crate::gas_feed::GasPriceFeed;
@@ -137,8 +138,11 @@ impl ArbitrageDetector {
         // Initial graph build
         self.rebuild_graph();
 
+        let mut sync_interval = time::interval(Duration::from_secs(300));
+
         loop {
             tokio::select! {
+                _ = sync_interval.tick() => { self.sync_registry(); }
                 Some(event) = self.priority_rx.recv() => {
                     SWAPS_RECEIVED.fetch_add(1, Ordering::Relaxed);
                     self.process_event(event, math).await;
