@@ -91,7 +91,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     let wss_raw = env::var("SHADOW_WS_URL")
         .or_else(|_| env::var("SHADOW_WS_URL_1"))
         .expect("🚀 Sniper needs SHADOW_WS_URL or SHADOW_WS_URL_1");
-    
+
     let wss_urls: Vec<String> = wss_raw
         .split(',')
         .map(|s| s.trim().to_string())
