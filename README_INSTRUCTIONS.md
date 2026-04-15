@@ -1,6 +1,6 @@
 # 🥷 THE SOVEREIGN SHADOW: DEPLOYMENT MANUAL
 
-Ye aapka exact command-line guide hai Base Mainnet par bot ko zero error ke saath start karne ke liye.
+Ye aapka exact command-line guide hai Base Mainnet par unified bot ko zero error ke saath start karne ke liye (Single Instance Deployment).
 
 ## Phase 1: Environment Setup
 
@@ -62,7 +62,7 @@ forge create src/ShadowBot.sol:ShadowBot \
 1. **🛡️ 3x Gas Rule:** Sirf wahi trade fire karein jahan `Expected Profit > 3 * (L1_Data_Fee + L2_Execution_Fee)`.
 2. **🥷 Private Bundles Only:** Kabhi भी trade public mempool mein mat bhejo. Hamesha Flashbots ya Base PBH (Private Bundle Handler) use karo.
 3. **⚛️ Atomic Revert:** Zero-Loss Shield hamesha ON rakhein. Simulation mein `top_sim` profit से `MAX_BRANCH_LOSS_BPS` (10%) से ज़्यादा drop होते ही trade automatically kill हो जाएगी।
-4. **Global gRPC:** Sniper hamesha empty RAM ke saath ready rahega, Scouts global data stream karenge.
+4. **Unified Intelligence:** Mempool scanning aur Execution ab ek hi process mein hain for ultra-low latency.
 
 ---
 **Lead Architect Note:** Aapka ₹200 ka budget sirf gas ke liye hai. Bot automatically Aave aur Balancer se Flash Loans lega, isliye liquidity ki tension na lein.

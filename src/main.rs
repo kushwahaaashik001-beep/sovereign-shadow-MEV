@@ -40,9 +40,6 @@ use hydra::{RawOpportunity, Empty};
 use tonic::{transport::Server, Request, Response, Status, Streaming, metadata::MetadataValue};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = std::env::args().collect();
-    let mode = args.get(1).map(|s| s.as_str()).unwrap_or("sniper");
-
     let core_ids = core_affinity::get_core_ids().expect("Failed to get core IDs");
     let core_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -55,16 +52,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         })
         .build()?;
 
-    match mode {
-        "scout" => {
-            info!("👁️ Space A: Global Scout Mode Starting...");
-            runtime.block_on(run_scout())
-        }
-        _ => {
-            info!("🎯 Space B: Sniper Brain Mode Starting...");
-            runtime.block_on(run_engine())
-        }
-    }
+    info!("🎯 Sovereign Shadow Unified Engine Starting...");
+    runtime.block_on(run_engine())
 }
 
 async fn run_engine() -> Result<(), Box<dyn Error>> {
@@ -412,7 +401,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
 
     // Global Deduplication Cache & Shared Decoder
     let decoder = Arc::new(the_sovereign_shadow::universal_decoder::UniversalDecoder::new());
-    let seen_hashes = Arc::new(DashSet::with_capacity_and_hasher(100_000, std::hash::BuildHasherDefault::<rustc_hash::FxHasher>::default()));
+    let seen_hashes = Arc::new(DashSet::with_capacity_and_hasher(50_000, std::hash::BuildHasherDefault::<rustc_hash::FxHasher>::default()));
 
     // Nerve Bridge A: Connects Local Listeners to the Brain with Deduplication
     let s_tx = swap_tx.clone();
@@ -428,7 +417,11 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
             // Pillar W: Feed organic traders into the registry
             mirror_bridge.record_trader(event.swap_info.router, event.sender);
 
-            if seen_hashes_local.len() > 100_000 { seen_hashes_local.clear(); }
+            // Self-Cleaning Cache: Keep RAM tight for Hugging Face
+            if seen_hashes_local.len() > 50_000 { 
+                seen_hashes_local.clear(); 
+                info!("🧹 [CLEANUP] Deduplication cache cleared to save RAM");
+            }
 
             let _ = s_tx.send(event).await;
         }
@@ -447,7 +440,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
             if !seen_hashes_grpc.insert(tx_hash) {
                 continue;
             }
-            if seen_hashes_grpc.len() > 100_000 { seen_hashes_grpc.clear(); }
+            if seen_hashes_grpc.len() > 50_000 { seen_hashes_grpc.clear(); }
 
             // Real-time Gas Integration: Use actual gas price observed by the Scout
             let effective_gas_price = alloy_primitives::U256::from(raw.gas_price);
@@ -644,78 +637,6 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
                 break;
             }
         }
-    }
-
-    Ok(())
-}
-
-async fn run_scout() -> Result<(), Box<dyn Error>> {
-    dotenv().ok();
-    
-    let scout_id = env::var("SCOUT_ID").unwrap_or_else(|_| "global-scout-01".to_string());
-    let wss_raw = env::var("SHADOW_WS_URL")
-        .or_else(|_| env::var("SHADOW_WS_URL_1"))
-        .expect("👁️ Scout needs SHADOW_WS_URL");
-    
-    let wss_urls: Vec<String> = wss_raw
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .collect();
-
-    // Default to dynamic port if not specified (Hugging Face default)
-    let sniper_url = env::var("SNIPER_URL").unwrap_or_else(|_| "http://0.0.0.0:7860".to_string());
-    
-    info!("👁️ [SCOUT {}] Initializing Global Eye", scout_id);
-
-    // 1. Setup gRPC Connection to Space B (Sniper)
-    let channel = tonic::transport::Channel::from_shared(sniper_url)?
-        .tcp_nodelay(true) 
-        .connect_lazy();
-    let mut client = hydra::hydra_network_client::HydraNetworkClient::new(channel);
-
-    let (grpc_tx, grpc_rx) = mpsc::channel(4096);
-    let stream = ReceiverStream::new(grpc_rx);
-
-    tokio::spawn(async move {
-        if let Err(e) = client.stream_opportunities(stream).await {
-            error!("❌ [SCOUT] gRPC Stream broken: {}", e);
-        }
-    });
-
-    // 2. Setup Local Mempool Listener
-    let chain_name = env::var("CHAIN").unwrap_or_else(|_| "base".to_string());
-    let chain = match chain_name.as_str() {
-        "base" => the_sovereign_shadow::models::Chain::Base,
-        _ => the_sovereign_shadow::models::Chain::Mainnet,
-    };
-
-    let (mempool_listener, mut mempool_rx, _) = MempoolListener::new(
-        MempoolListenerConfig {
-            endpoints: wss_urls,
-            chain,
-            ..Default::default()
-        },
-        None,
-    ).await?;
-
-    tokio::spawn(async move {
-        if let Err(e) = mempool_listener.run().await {
-            error!("❌ Scout Mempool Listener crashed: {:?}", e);
-        }
-    });
-
-    info!("🚀 [SCOUT {}] Space A ACTIVE - Gossiping binary data to Sniper", scout_id);
-
-    while let Some(event) = mempool_rx.recv().await {
-        let opportunity = RawOpportunity {
-            tx_hash: event.tx_hash.to_vec(),
-            pool_address: event.swap_info.router.to_vec(),
-            data_payload: event.mempool_tx.map(|m| m.data.0.to_vec()).unwrap_or_default(),
-            timestamp: event.received_at.elapsed().as_nanos() as i64,
-            gas_price: event.effective_gas_price.to::<u64>(),
-        };
-
-        let _ = grpc_tx.try_send(opportunity);
     }
 
     Ok(())

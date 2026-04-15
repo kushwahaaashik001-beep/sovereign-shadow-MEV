@@ -51,7 +51,4 @@ COPY --from=builder /usr/src/app/target/release/the-sovereign-shadow /app/
 ENV PORT=7860
 EXPOSE 7860
 
-# Pillar MODE: Support for Double Space architecture
-ENV MODE=sniper
-
-CMD ["sh", "-c", "./the-sovereign-shadow ${MODE}"]
+CMD ["./the-sovereign-shadow"]
