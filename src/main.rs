@@ -708,9 +708,9 @@ async fn run_scout() -> Result<(), Box<dyn Error>> {
 
     while let Some(event) = mempool_rx.recv().await {
         let opportunity = RawOpportunity {
-            tx_hash: bytes::Bytes::copy_from_slice(event.tx_hash.as_slice()),
-            pool_address: bytes::Bytes::copy_from_slice(event.swap_info.router.as_slice()),
-            data_payload: event.mempool_tx.map(|m| m.data.0).unwrap_or_default().into(),
+            tx_hash: event.tx_hash.to_vec(),
+            pool_address: event.swap_info.router.to_vec(),
+            data_payload: event.mempool_tx.map(|m| m.data.0.to_vec()).unwrap_or_default(),
             timestamp: event.received_at.elapsed().as_nanos() as i64,
             gas_price: event.effective_gas_price.to::<u64>(),
         };

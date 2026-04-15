@@ -107,9 +107,9 @@ async fn run_scout() -> Result<(), Box<dyn Error>> {
                 let input_vec = tx.input.0; 
 
                 let opportunity = RawOpportunity {
-                    tx_hash: bytes::Bytes::copy_from_slice(tx.hash.as_slice()), // Efficient Copy
-                    pool_address: bytes::Bytes::copy_from_slice(to.as_slice()), // Efficient Copy
-                    data_payload: input_vec.into(), // Convert inner Vec to Bytes
+                    tx_hash: tx.hash.to_vec(),
+                    pool_address: to.to_vec(),
+                    data_payload: input_vec.to_vec(),
                     timestamp: timestamp as i64,
                     gas_price: tx.gas_price.unwrap_or_default() as u64,
                 };
