@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     cmake \
+    git \
     protobuf-compiler \
     g++ \
     && rm -rf /var/lib/apt/lists/*
@@ -13,9 +14,12 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /usr/src/app
 COPY . .
 
-# Build with high-level optimization (Release Mode)
-# Cargo.toml already has strip = true and lto = "fat" for nanosecond edge.
-RUN cargo build --release
+# Pillar HF Optimization: Limit parallel jobs to prevent OOM (Out of Memory)
+# We also ensure protoc can find the proto files
+ENV PROTOC_NO_VENDOR=1
+RUN CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    cargo build --release --jobs 2
+
 
 # --- STAGE 2: THE FORTRESS RUNTIME ---
 FROM debian:bookworm-slim
