@@ -1,0 +1,6 @@
+syntax = "proto3";
+
+package hydra;
+
+// Common types for the 'hydra' package can be defined here.
+// 'Empty' message has been moved to shadow.proto to avoid redefinition errors.

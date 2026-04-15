@@ -1,57 +1,52 @@
-use crate::models::{SwapInfo, PoolKey};
-use crate::universal_decoder::UniversalDecoder;
-use dashmap::DashMap;
-use arc_swap::ArcSwap;
-use ethers::{
-    prelude::*,
-    providers::{Provider, Ws},
-    types::{Transaction, H256, U256},
-};
-use futures_util::stream::{SelectAll, Stream};
-use futures_util::StreamExt;
-use rand::Rng;
+#![allow(dead_code)]
+use alloy_primitives::{Address, B256, U256};
+use alloy::rpc::types::Transaction as AlloyTransaction;
+use alloy::providers::{Provider, ProviderBuilder, WsConnect};
+use crate::models::{Chain, SwapInfo, PoolKey, MempoolTx};
+use crate::universal_decoder::{UniversalDecoder, DecodeTx};
+use crate::constants::TARGET_ROUTERS;
+use futures_util::stream::StreamExt;
+use dashmap::DashSet;
+use rustc_hash::FxHasher;
+use std::hash::BuildHasherDefault;
 use rustc_hash::FxHashSet;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel, UnboundedReceiver};
-use tokio::time;
-use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn, debug};
 
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct MempoolListenerConfig {
-    pub endpoints:              Vec<String>,
-    pub stealth:                bool,
-    pub extra_endpoints:        Vec<String>,
-    pub worker_count:           usize,
-    pub fetcher_count:          usize,
-    pub tracked_pools:          Arc<FxHashSet<PoolKey>>,
-    pub use_txpool_content:     bool,
+    pub endpoints: Vec<String>,
+    pub stealth: bool,
+    pub extra_endpoints: Vec<String>,
+    pub worker_count: usize,
+    pub fetcher_count: usize,
+    pub tracked_pools: Arc<FxHashSet<PoolKey>>,
+    pub use_txpool_content: bool,
     pub txpool_poll_interval_ms: u64,
-    pub chain:                  Chain,
-    pub min_gas_price_gwei:     u64,
+    pub chain: Chain,
+    pub min_gas_price_gwei: u64,
     pub heartbeat_interval_secs: Option<u64>,
-    pub sequencer_endpoint:     Option<String>,
+    pub sequencer_endpoint: Option<String>,
 }
 
 impl Default for MempoolListenerConfig {
     fn default() -> Self {
         Self {
-            endpoints:              vec![],
-            stealth:                false,
-            extra_endpoints:        vec![],
-            worker_count:           4, // [HF FIX] Reduced threads to save stack memory
-            fetcher_count:          4, // [HF FIX] Prevents CPU starvation
-            tracked_pools:          Arc::new(FxHashSet::default()),
-            use_txpool_content:     false,
+            endpoints: vec![],
+            stealth: false,
+            extra_endpoints: vec![],
+            worker_count: 4,
+            fetcher_count: 4,
+            tracked_pools: Arc::new(FxHashSet::default()),
+            use_txpool_content: false,
             txpool_poll_interval_ms: 200,
-            chain:                  Chain::Mainnet,
-            min_gas_price_gwei:     0,
+            chain: Chain::Mainnet,
+            min_gas_price_gwei: 0,
             heartbeat_interval_secs: Some(20),
-            sequencer_endpoint:     None,
+            sequencer_endpoint: None,
         }
     }
 }
@@ -59,446 +54,215 @@ impl Default for MempoolListenerConfig {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct SwapEvent {
-    pub tx_hash:             H256,
-    pub sender:              Address,
-    pub swap_info:           SwapInfo,
+    pub tx_hash: B256,
+    pub sender: Address,
+    pub swap_info: SwapInfo,
     pub effective_gas_price: U256,
-    pub received_at:         Instant,
-    pub is_whale_trigger:    bool,
+    pub received_at: Instant,
+    pub is_whale_trigger: bool,
+    pub mempool_tx: Option<MempoolTx>,
 }
 
 #[derive(Debug, thiserror::Error)]
-#[allow(dead_code)]
 pub enum ListenerError {
-    #[error("Provider error: {0}")]
-    Provider(#[from] ProviderError),
-    #[error("Decoding error: {0}")]
-    Decode(String),
     #[error("No endpoints available")]
     NoEndpoints,
-    #[error("Stream ended")]
-    StreamEnded,
-    #[error("Heartbeat failed")]
-    HeartbeatFailed,
     #[error("Other error: {0}")]
     Other(Box<dyn std::error::Error + Send + Sync>),
 }
 
-struct ProviderPool {
-    providers: Vec<Arc<Provider<Ws>>>,
-    next:      AtomicUsize,
-}
-
-impl ProviderPool {
-    fn new(providers: Vec<Arc<Provider<Ws>>>) -> Self {
-        Self { providers, next: AtomicUsize::new(0) }
-    }
-    fn next(&self) -> Arc<Provider<Ws>> {
-        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.providers.len();
-        self.providers[idx].clone()
-    }
-}
-
-struct BaseFeeCache {
-    value: Arc<ArcSwap<Option<U256>>>,
-}
-impl BaseFeeCache {
-    fn new() -> Self { Self { value: Arc::new(ArcSwap::from_pointee(None)) } }
-    fn update(&self, v: Option<U256>) { self.value.store(Arc::new(v)); }
-    fn get(&self) -> Option<U256> { **self.value.load() }
-}
-
-struct ListenerStats {
-    txs_seen:       AtomicU64,
-    txs_deduped:    AtomicU64,
-    swaps_detected: AtomicU64,
-    errors:         AtomicU64,
-    last_rotation:  AtomicU64,
-    reconnects:     AtomicU64,
-}
-impl ListenerStats {
-    fn new() -> Self {
-        Self {
-            txs_seen:       AtomicU64::new(0),
-            txs_deduped:    AtomicU64::new(0),
-            swaps_detected: AtomicU64::new(0),
-            errors:         AtomicU64::new(0),
-            last_rotation:  AtomicU64::new(0),
-            reconnects:     AtomicU64::new(0),
-        }
-    }
-}
-
 pub struct MempoolListener {
-    config:           MempoolListenerConfig,
-    event_tx:         UnboundedSender<SwapEvent>,
-    priority_tx:      UnboundedSender<SwapEvent>,
-    provider_pool:    Arc<ProviderPool>,
-    stream_selector:  SelectAll<Pin<Box<dyn Stream<Item = Transaction> + Send>>>,
-    stats:            Arc<ListenerStats>,
-    tx_hash_cache:    Arc<DashMap<H256, Instant>>,
-    stream_sender:    UnboundedSender<Pin<Box<dyn Stream<Item = Transaction> + Send>>>,
-    base_fee_cache:   Arc<BaseFeeCache>,
-    worker_txs:       Vec<UnboundedSender<(Transaction, Instant)>>,
-    worker_rxs:       Vec<UnboundedReceiver<(Transaction, Instant)>>,
-    decoder:          Arc<UniversalDecoder>,
+    config: MempoolListenerConfig,
+    event_tx: UnboundedSender<SwapEvent>,
+    priority_tx: UnboundedSender<SwapEvent>,
+    p2p_tx: UnboundedSender<AlloyTransaction>,
+    p2p_rx: UnboundedReceiver<AlloyTransaction>,
+    seen_hashes: Arc<DashSet<B256, BuildHasherDefault<FxHasher>>>,
 }
 
 impl MempoolListener {
     pub async fn new(
         config: MempoolListenerConfig,
+        _grpc_tx: Option<UnboundedSender<SwapEvent>>,
     ) -> Result<(Self, UnboundedReceiver<SwapEvent>, UnboundedReceiver<SwapEvent>), ListenerError> {
-        let (event_tx,    event_rx)    = unbounded_channel();
+        let (event_tx, event_rx) = unbounded_channel();
         let (priority_tx, priority_rx) = unbounded_channel();
-        let (stream_sender, _)         = unbounded_channel::<Pin<Box<dyn Stream<Item = Transaction> + Send>>>();
-
-        let mut all_endpoints = config.endpoints.clone();
-        if config.stealth { all_endpoints.extend(config.extra_endpoints.clone()); }
-        if all_endpoints.is_empty() { return Err(ListenerError::NoEndpoints); }
-
-        let mut providers = Vec::new();
-        for ep in &all_endpoints {
-            match Provider::<Ws>::connect(ep).await {
-                Ok(p)  => providers.push(Arc::new(p)),
-                Err(e) => warn!("Failed to connect to {}: {}", ep, e),
-            }
-        }
-        if providers.is_empty() { return Err(ListenerError::NoEndpoints); }
-        let provider_pool = Arc::new(ProviderPool::new(providers));
-
-        let stats          = Arc::new(ListenerStats::new());
-        let base_fee_cache = Arc::new(BaseFeeCache::new());
-
-        let mut stream_selector = SelectAll::new();
-        // [FIX] Subscribe using all providers in the pool for maximum redundancy and initial setup
-        // This loop is for initial setup. The `run` loop's `else` branch will handle reconnections.
-        // We clone `provider_pool.providers` to avoid holding a mutable reference across await points if `provider_pool.next()` was used.
-        for provider in provider_pool.providers.iter() {
-            if let Ok(stream) = Self::create_block_tx_stream(provider.clone(), config.fetcher_count).await {
-                stream_selector.push(stream);
-            }
-        }
-
-        let mut worker_txs = Vec::with_capacity(config.worker_count);
-        let mut worker_rxs = Vec::with_capacity(config.worker_count);
-        for _ in 0..config.worker_count {
-            let (tx, rx) = unbounded_channel::<(Transaction, Instant)>();
-            worker_txs.push(tx);
-            worker_rxs.push(rx);
-        }
-
+        let (p2p_tx, p2p_rx) = unbounded_channel();
         Ok((
-            Self {
-                config: config.clone(),
-                event_tx, priority_tx,
-                provider_pool,
-                stream_selector, stats,
-                tx_hash_cache: Arc::new(DashMap::new()),
-                stream_sender, base_fee_cache,
-                worker_txs, worker_rxs,
-                decoder: Arc::new(UniversalDecoder::new()),
+            Self { 
+                config, 
+                event_tx, 
+                priority_tx, 
+                p2p_tx, 
+                p2p_rx,
+                seen_hashes: Arc::new(DashSet::with_capacity_and_hasher(100_000, BuildHasherDefault::default())),
             },
             event_rx,
             priority_rx,
         ))
     }
 
-    /// Block-based TX stream — works on Anvil AND real Base mainnet.
-    /// Fetches ALL transactions from every new block.
-    /// Captures V2 + V3 + Universal Router swaps.
-    async fn create_block_tx_stream(
-        provider:      Arc<Provider<Ws>>,
-        fetcher_count: usize,
-    ) -> Result<Pin<Box<dyn Stream<Item = Transaction> + Send>>, ListenerError> {
-        info!("🔌 [PILLAR A] Block-based TX stream starting (concurrency={})...", fetcher_count);
+    pub fn p2p_tx(&self) -> UnboundedSender<AlloyTransaction> {
+        self.p2p_tx.clone()
+    }
 
-        let (tx_out, tx_in) = unbounded_channel::<Transaction>();
-        let p   = provider.clone();
-        let t   = tx_out.clone();
+    pub async fn run(self) -> Result<(), ListenerError> {
+        info!("🚀 [Pillar A] Mempool Surveillance Active on {:?}", self.config.chain);
+        
+        let decoder = Arc::new(UniversalDecoder::new());
+        let seen_hashes = self.seen_hashes.clone();
+        let mut tasks = Vec::new();
 
-        tokio::spawn(async move {
-            loop {
-                match p.subscribe_blocks().await {
-                    Ok(mut stream) => {
-                        info!("✅ [PILLAR A] Block subscription live — capturing ALL txs per block");
-                        let sem = Arc::new(tokio::sync::Semaphore::new(fetcher_count));
-                        while let Some(block) = stream.next().await {
-                            let hash = match block.hash { Some(h) => h, None => continue };
-                            let p2   = p.clone();
-                            let t2   = t.clone();
-                            let permit = match sem.clone().try_acquire_owned() {
-                                Ok(p)  => p,
-                                Err(_) => continue, // saturated — skip block
-                            };
-                            tokio::spawn(async move {
-                                if let Ok(Some(full)) = p2.get_block_with_txs(hash).await {
-                                    for tx in full.transactions {
-                                        let _ = t2.send(tx);
+        // Pillar T: Integrated P2P Sentry Stream (Zero-latency direct feed)
+        let mut p2p_rx = self.p2p_rx;
+        let event_tx_p2p = self.event_tx.clone();
+        let decoder_p2p = decoder.clone();
+        let config_p2p = self.config.clone();
+        let seen_hashes_p2p = seen_hashes.clone();
+        tasks.push(tokio::spawn(async move {
+            while let Some(tx) = p2p_rx.recv().await {
+                Self::process_raw_tx(&tx, &decoder_p2p, &event_tx_p2p, &config_p2p, &seen_hashes_p2p);
+            }
+        }));
+
+        // Pillar T: txpool_content Polling (Secondary feed for hidden txs)
+        if self.config.use_txpool_content {
+            let event_tx = self.event_tx.clone();
+            let decoder = decoder.clone();
+            let config = self.config.clone();
+            let seen_hashes_poll = seen_hashes.clone();
+            
+            if let Some(endpoint) = self.config.endpoints.first() {
+                let endpoint = endpoint.clone();
+                tasks.push(tokio::spawn(async move {
+                    if let Ok(url) = endpoint.parse() {
+                        let provider = Arc::new(ProviderBuilder::new().on_http(url));
+                        let mut interval = tokio::time::interval(Duration::from_millis(config.txpool_poll_interval_ms));
+                        loop {
+                            interval.tick().await;
+                            let res: Result<serde_json::Value, _> = provider.raw_request("txpool_content".into(), Vec::<String>::new()).await;
+                            if let Ok(content) = res {
+                                if let Some(pending) = content.get("pending").and_then(|p| p.as_object()) {
+                                    for txs in pending.values() {
+                                        if let Some(tx_map) = txs.as_object() {
+                                            for tx_val in tx_map.values() {
+                                                if let Ok(tx) = serde_json::from_value::<AlloyTransaction>(tx_val.clone()) {
+                                                    Self::process_raw_tx(&tx, &decoder, &event_tx, &config, &seen_hashes_poll);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
-                                drop(permit);
-                            });
-                        }
-                        warn!("[PILLAR A] Block stream ended — reconnecting in 1s");
-                    }
-                    Err(e) => warn!("[PILLAR A] subscribe_blocks error: {} — retrying in 1s", e),
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        });
-
-        Ok(Box::pin(UnboundedReceiverStream::new(tx_in)))
-    }
-
-    pub async fn run(mut self) -> Result<(), ListenerError> {
-        info!("Mempool listener started (stealth={})", self.config.stealth);
-
-        let (stream_sender, mut stream_receiver) = unbounded_channel();
-        self.stream_sender = stream_sender;
-
-        self.spawn_block_listener();
-        let worker_rxs = std::mem::take(&mut self.worker_rxs);
-        self.spawn_workers(worker_rxs);
-
-        if self.config.stealth && self.provider_pool.providers.len() > 1 {
-            self.spawn_rotator();
-        }
-        if let Some(interval) = self.config.heartbeat_interval_secs {
-            self.spawn_heartbeat(interval);
-        }
-
-        // Cache cleanup
-        let cache = self.tx_hash_cache.clone();
-        tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_secs(15));
-            loop {
-                interval.tick().await;
-                let now = Instant::now();
-                cache.retain(|_, &mut v| now.duration_since(v) < Duration::from_secs(15));
-            }
-        });
-
-        // Stats logger
-        let stats_clone = self.stats.clone();
-        tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_secs(10));
-            loop {
-                interval.tick().await;
-                info!(
-                    "Mempool Stats - Seen: {}, Deduped: {}, Swaps: {}, Errors: {}",
-                    stats_clone.txs_seen.load(Ordering::Relaxed),
-                    stats_clone.txs_deduped.load(Ordering::Relaxed),
-                    stats_clone.swaps_detected.load(Ordering::Relaxed),
-                    stats_clone.errors.load(Ordering::Relaxed),
-                );
-            }
-        });
-
-        let mut current_worker = 0;
-        let worker_count = self.worker_txs.len();
-
-        loop {
-            tokio::select! {
-                Some(_) = stream_receiver.recv() => {
-                    info!("New mempool stream added");
-                }
-                Some(tx) = self.stream_selector.next() => {
-                    if self.tx_hash_cache.contains_key(&tx.hash) {
-                        self.stats.txs_deduped.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    let received_at = Instant::now();
-                    self.tx_hash_cache.insert(tx.hash, received_at);
-                    self.stats.txs_seen.fetch_add(1, Ordering::Relaxed);
-
-                    if self.worker_txs[current_worker].send((tx, received_at)).is_err() {
-                        error!("Worker channel {} closed", current_worker);
-                    }
-                    current_worker = (current_worker + 1) % worker_count;
-                }
-                else => {
-                    warn!("All streams ended, reconnecting...");
-                    // [FIX] Clear existing streams and re-subscribe to ALL providers in the pool
-                    // This ensures all available WSS connections are re-attempted.
-                    self.stream_selector = SelectAll::new(); // Clear all previous streams
-                    for provider in self.provider_pool.providers.iter() {
-                        time::sleep(Duration::from_millis(100)).await; // Small delay to avoid hammering RPCs
-                        if let Ok(stream) = Self::create_block_tx_stream(provider.clone(), self.config.fetcher_count).await {
-                            self.stream_selector.push(stream);
-                            self.stats.reconnects.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
-                }
+                }));
             }
         }
-    }
 
-    fn spawn_block_listener(&self) -> tokio::task::JoinHandle<()> {
-        let provider       = self.provider_pool.next();
-        let base_fee_cache = self.base_fee_cache.clone();
-        tokio::spawn(async move {
-            if let Ok(mut stream) = provider.subscribe_blocks().await {
-                while let Some(block) = stream.next().await {
-                    base_fee_cache.update(block.base_fee_per_gas);
-                }
-            }
-        })
-    }
+        for endpoint in &self.config.endpoints {
+            let endpoint = endpoint.clone();
+            let event_tx = self.event_tx.clone();
+            let decoder = decoder.clone();
+            let config = self.config.clone();
+            let seen_hashes_ws = seen_hashes.clone();
 
-    fn spawn_workers(
-        &self,
-        mut worker_rxs: Vec<UnboundedReceiver<(Transaction, Instant)>>,
-    ) -> Vec<tokio::task::JoinHandle<()>> {
-        let mut handles = Vec::new();
-        let count = worker_rxs.len();
-
-        for i in 0..count {
-            let event_tx       = self.event_tx.clone();
-            let priority_tx    = self.priority_tx.clone();
-            let tracked        = self.config.tracked_pools.clone();
-            let stats          = self.stats.clone();
-            let min_gas        = self.config.min_gas_price_gwei;
-            let base_fee_cache = self.base_fee_cache.clone();
-            let decoder        = self.decoder.clone();
-            let mut rx         = worker_rxs.remove(0);
-
-            let handle = tokio::spawn(async move {
-                info!("Worker {} started (Lock-Free)", i);
-                while let Some((tx, received_at)) = rx.recv().await {
-                    let hash = tx.hash;
-                    if let Err(e) = Self::process_transaction(
-                        &tx, tracked.clone(),
-                        event_tx.clone(), priority_tx.clone(),
-                        stats.clone(), min_gas,
-                        base_fee_cache.clone(), received_at,
-                        decoder.clone(),
-                    ).await {
-                        stats.errors.fetch_add(1, Ordering::Relaxed);
-                        debug!("Error processing tx {}: {}", hash, e);
+            let task = tokio::spawn(async move {
+                loop {
+                    debug!("📡 Attempting connection to: {}", endpoint);
+                    if let Ok(ws) = Ok::<WsConnect, ListenerError>(WsConnect::new(endpoint.clone())) {
+                        if let Ok(provider) = ProviderBuilder::new().on_ws(ws).await {
+                            info!("✅ Connected to mempool feed: {}", endpoint);
+                            
+                            // Optimization: Try full transaction streaming first
+                            if let Ok(sub) = provider.subscribe_full_pending_transactions().await {
+                                let mut stream = sub.into_stream();
+                                while let Some(tx) = stream.next().await {
+                                    Self::process_raw_tx(&tx, &decoder, &event_tx, &config, &seen_hashes_ws);
+                                }
+                            } else if let Ok(sub) = provider.subscribe_pending_transactions().await {
+                                // Fallback: Hash stream + Parallel Fetching
+                                let mut stream = sub.into_stream();
+                                while let Some(hash) = stream.next().await {
+                                    let p = provider.clone();
+                                    let d = decoder.clone();
+                                    let et = event_tx.clone();
+                                    let c = config.clone();
+                                    let sh = seen_hashes_ws.clone();
+                                    tokio::spawn(async move {
+                                        if let Ok(Some(tx)) = p.get_transaction_by_hash(hash).await {
+                                            Self::process_raw_tx(&tx, &d, &et, &c, &sh);
+                                        }
+                                    });
+                                }
+                            }
+                        }
                     }
+                    warn!("🔄 Mempool connection lost [{}]. Retrying in 5s...", endpoint);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
-                warn!("Worker {} shutting down", i);
             });
-            handles.push(handle);
-        }
-        handles
-    }
-
-    fn spawn_rotator(&self) -> tokio::task::JoinHandle<()> {
-        let config        = self.config.clone();
-        let stats         = self.stats.clone();
-        let provider_pool = self.provider_pool.providers.clone();
-        let stream_sender = self.stream_sender.clone();
-
-        tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                if !config.stealth { continue; }
-                let now  = Instant::now().elapsed().as_secs();
-                let last = stats.last_rotation.load(Ordering::Relaxed);
-                if now - last < 60 { continue; }
-
-                let do_rotate = {
-                    let mut rng = rand::thread_rng();
-                    rng.gen_bool(0.05)
-                };
-                if do_rotate {
-                    let idx      = { let mut rng = rand::thread_rng(); rng.gen_range(0..provider_pool.len()) };
-                    let provider = provider_pool[idx].clone();
-                    if let Ok(stream) = Self::create_block_tx_stream(provider, 16).await {
-                        let _ = stream_sender.send(stream);
-                        stats.last_rotation.store(now, Ordering::Relaxed);
-                        info!("Rotated to new RPC provider");
-                    }
-                }
-            }
-        })
-    }
-
-    fn spawn_heartbeat(&self, interval_secs: u64) -> tokio::task::JoinHandle<()> {
-        let provider = self.provider_pool.next();
-        tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_secs(interval_secs));
-            loop {
-                interval.tick().await;
-                match provider.get_block_number().await {
-                    Ok(_)  => debug!("Heartbeat OK"),
-                    Err(e) => warn!("Heartbeat failed: {}", e),
-                }
-            }
-        })
-    }
-
-    fn effective_gas_price(tx: &Transaction, base_fee: Option<U256>) -> U256 {
-        if let Some(price) = tx.gas_price { return price; }
-        if let (Some(max_fee), Some(priority), Some(base)) =
-            (tx.max_fee_per_gas, tx.max_priority_fee_per_gas, base_fee)
-        {
-            let proposed = base + priority;
-            return if max_fee < proposed { max_fee } else { proposed };
-        }
-        tx.max_fee_per_gas.unwrap_or(U256::zero())
-    }
-
-    async fn process_transaction(
-        tx:             &Transaction,
-        tracked_pools:  Arc<FxHashSet<PoolKey>>,
-        event_tx:       UnboundedSender<SwapEvent>,
-        priority_tx:    UnboundedSender<SwapEvent>,
-        stats:          Arc<ListenerStats>,
-        min_gas_gwei:   u64,
-        base_fee_cache: Arc<BaseFeeCache>,
-        received_at:    Instant,
-        decoder:        Arc<UniversalDecoder>,
-    ) -> Result<(), ListenerError> {
-        let base_fee     = base_fee_cache.get();
-        let effective_gas = Self::effective_gas_price(tx, base_fee);
-
-        if effective_gas < U256::from(min_gas_gwei * 1_000_000_000) {
-            return Ok(());
+            tasks.push(task);
         }
 
-        // Must have a recipient
-        let _to = match tx.to { Some(a) => a, None => return Ok(()) };
-
-        // Must have calldata (swap functions need at least 4 bytes)
-        if tx.input.0.len() < 4 { return Ok(()); }
-
-        // Decode swaps from this transaction
-        let swaps = decoder.decode_transaction_deep(tx);
-        for swap_res in swaps {
-            let swap: SwapInfo = match swap_res {
-                Ok(s)  => s,
-                Err(_) => { stats.errors.fetch_add(1, Ordering::Relaxed); continue; }
-            };
-
-            if !tracked_pools.is_empty() && !swap.is_tracked(&tracked_pools) {
-                continue;
-            }
-
-            stats.swaps_detected.fetch_add(1, Ordering::Relaxed);
-
-            // Whale detection: ~$100k at $2600/ETH
-            const WHALE_WEI: u128 = 38_461_538_461_538_461_538;
-            let is_whale = swap.amount_in >= U256::from(WHALE_WEI);
-
-            let event = SwapEvent {
-                tx_hash:             tx.hash,
-                sender:              tx.from,
-                swap_info:           swap,
-                effective_gas_price: effective_gas,
-                received_at,
-                is_whale_trigger:    is_whale,
-            };
-
-            if is_whale {
-                let _ = priority_tx.send(event);
-            } else {
-                let _ = event_tx.send(event);
-            }
+        // Keep the main loop alive
+        for task in tasks {
+            let _ = task.await;
         }
-
         Ok(())
+    }
+
+    #[inline(always)]
+    fn process_raw_tx(
+        tx: &AlloyTransaction,
+        decoder: &UniversalDecoder,
+        event_tx: &UnboundedSender<SwapEvent>,
+        config: &MempoolListenerConfig,
+        seen_hashes: &DashSet<B256, BuildHasherDefault<FxHasher>>,
+    ) {
+        // 0. Deduplication Filter: Skip if already processed (P2P wins usually)
+        if !seen_hashes.insert(tx.hash) {
+            return;
+        }
+        if seen_hashes.len() > 100_000 { seen_hashes.clear(); }
+
+        // 1. Zero-Cost Pre-Filter: Check if 'to' is a relevant contract
+        let to = match tx.to {
+            Some(addr) => addr,
+            None => return,
+        };
+
+        if !TARGET_ROUTERS.contains(&to) && !config.tracked_pools.contains(&PoolKey { pool: to }) {
+            return;
+        }
+
+        // 2. Efficient Data Conversion
+        // Converting alloy_primitives::Bytes to bytes::Bytes (ref-counted)
+        let input_ref = bytes::Bytes::from(tx.input.0.clone());
+
+        let decode_tx = DecodeTx {
+            to: Some(to),
+            value: tx.value,
+            input: input_ref,
+        };
+
+        let swaps = decoder.decode(&decode_tx);
+        for swap in swaps {
+            let event = SwapEvent {
+                tx_hash: tx.hash,
+                sender: tx.from,
+                swap_info: swap,
+                effective_gas_price: U256::from(tx.gas_price.unwrap_or_default()),
+                received_at: Instant::now(),
+                is_whale_trigger: tx.value > U256::from(10u128.pow(18)), // 1 ETH trigger
+                mempool_tx: Some(MempoolTx {
+                    data: tx.input.clone(),
+                    hash: tx.hash,
+                    to: tx.to,
+                }),
+            };
+            // Send to detector channel
+            let _ = event_tx.send(event);
+        }
     }
 }

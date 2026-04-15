@@ -1,225 +1,72 @@
-use ethers::prelude::*;
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
-use crate::factory_scanner::{NewPoolEvent, V2PoolData};
-use crate::models::DexName;
-use crate::rpc_manager::RpcManager;
-use tracing::{info, warn, debug};
+use alloy::providers::{RootProvider, Provider};
+use alloy::transports::BoxTransport;
+use alloy_primitives::{Address, B256};
+use alloy::rpc::types::Filter;
+use alloy_primitives::fixed_bytes;
+use std::sync::Arc;
 use tokio::sync::broadcast;
-use rustc_hash::FxHashMap;
-use anyhow::Result;
+use tracing::{info, error};
+use crate::factory_scanner::{NewPoolEvent, V2PoolData, V3PoolData};
+use crate::models::{Chain, DexName};
 
-// Factory ABI for fast discovery
-abigen!(
-    IFactory,
-    r#"[
-        function allPairsLength() external view returns (uint256)
-        function allPairs(uint256) external view returns (address)
-        function allPoolsLength() external view returns (uint256)
-        function allPools(uint256) external view returns (address)
-    ]"#
-);
-
-// Pool ABI to fetch tokens during bootstrap
-abigen!(
-    IPool,
-    r#"[
-        function token0() external view returns (address)
-        function token1() external view returns (address)
-    ]"#
-);
-
-/// God-level sync function to bootstrap pools from factories
-pub async fn sync_initial_pools(
-    rpc_manager: Arc<RpcManager>,
+/// Pillar Z: Historical pool discovery via log scanning (Warm Start).
+pub struct Discovery {
+    provider: Arc<RootProvider<BoxTransport>>,
     pool_tx: broadcast::Sender<NewPoolEvent>,
-    v2_factory: Address,
-    aero_factory: Address,
-    limit: usize,
-) -> Result<()> {
-    if v2_factory.is_zero() && aero_factory.is_zero() { return Ok(()); }
-    info!("🌊 [ZENITH] Bootstrapping {} RPC keys. (Limit: {})", rpc_manager.provider_count(), limit);
-    let shared_count = Arc::new(AtomicUsize::new(0));
-
-    // 1. Sync Uniswap V2 Pairs
-    if !v2_factory.is_zero() {
-        if let Err(e) = fetch_and_dispatch(rpc_manager.clone(), &pool_tx, v2_factory, "allPairs", limit, shared_count.clone()).await {
-            warn!("⚠️ V2 Factory sync failed: {}. Skipping...", e);
-        }
-    }
-    // 2. Sync Aerodrome Pools
-    if !aero_factory.is_zero() {
-        if let Err(e) = fetch_and_dispatch(rpc_manager.clone(), &pool_tx, aero_factory, "allPools", limit, shared_count.clone()).await {
-            warn!("⚠️ Aerodrome Factory sync failed: {}", e);
-        }
-    }
-
-    info!("🚀 Bootstrap complete! Check detector logs for Pool count.");
-    Ok(())
+    _chain: Chain,
 }
 
-async fn fetch_and_dispatch(
-    rpc_manager: Arc<RpcManager>,
-    tx: &broadcast::Sender<NewPoolEvent>,
-    factory_addr: Address,
-    method: &str,
-    limit: usize,
-    count: Arc<AtomicUsize>,
-) -> Result<()> {
-    let factory = IFactory::new(factory_addr, rpc_manager.get_next_provider());
-
-    let total_len = if method == "allPairs" {
-        match factory.all_pairs_length().call().await {
-            Ok(len) => len,
-            Err(e) => {
-                warn!("⚠️ Factory {:?} does not support 'allPairsLength'. Skipping V2 sync. Error: {}", factory_addr, e);
-                return Ok(());
-            }
-        }
-    } else {
-        match factory.all_pools_length().call().await {
-            Ok(len) => len,
-            Err(e) => {
-                warn!("⚠️ Factory {:?} does not support 'allPoolsLength'. Skipping Aerodrome sync. Error: {}", factory_addr, e);
-                return Ok(());
-            }
-        }
-    };
-
-    let total = total_len.as_u32() as usize;
-    let actual_fetch_count = std::cmp::min(total, limit);
-    // Pillar Z: Zenith Strategy - Fetch LATEST pools first (most liquid/active)
-    let dex_type = if method == "allPairs" { "UniswapV2/Standard" } else { "Aerodrome/Solidly" };
-    let start_idx = if total > actual_fetch_count { total - actual_fetch_count } else { 0 };
-    info!("🔍 [{}] Factory {:?} has {} pools. Loading LATEST {} pools...", dex_type, factory_addr, total, actual_fetch_count);
-
-    // Pillar Z: Multicall Batching for Token Discovery (CU Shield)
-    let multicall_address: Address = "0xcA11bde05977b3631167028862bE2a173976CA11".parse().unwrap();
-    let mut pool_addresses = Vec::new(); // Keep this
-
-    // Optimized: Fetch pool addresses in batches to prevent rate limits
-    let mut indices = Vec::with_capacity(actual_fetch_count);
-    for i in start_idx..total { indices.push(U256::from(i)); }
-
-    for chunk in indices.chunks(100) { // Aggressive batching for server deployment
-        if count.load(Ordering::Relaxed) >= limit { break; }
-
-        let mut call_data_list = Vec::new();
-        for &idx in chunk {
-            let data = if method == "allPairs" {
-                factory.all_pairs(idx).calldata().unwrap()
-            } else {
-                factory.all_pools(idx).calldata().unwrap()
-            };
-            call_data_list.push(Call3 {
-                target: factory_addr,
-                allow_failure: true,
-                call_data: data,
-            });
-        }
-
-        let multicall_for_addrs = IMulticall3::new(multicall_address, rpc_manager.get_next_provider());
-        if let Ok(results) = multicall_for_addrs.aggregate_3(call_data_list).call().await {
-            for res in results {
-                if res.0 && res.1.len() >= 32 {
-                    let pool_addr = Address::from_slice(&res.1[12..32]);
-                    if !pool_addr.is_zero() && pool_addr != factory_addr {
-                        pool_addresses.push(pool_addr);
-                    }
-                }
-            }
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await; // [BULLETPROOF] Heavy throttle for Discovery
+impl Discovery {
+    pub fn new(provider: Arc<RootProvider<BoxTransport>>, pool_tx: broadcast::Sender<NewPoolEvent>, chain: Chain) -> Self {
+        Self { provider, pool_tx, _chain: chain }
     }
 
-    // Multicall ABI for aggregate3
-    abigen!(
-        IMulticall3,
-        r#"[
-            struct Call3 { address target; bool allowFailure; bytes callData; }
-            struct Result3 { bool success; bytes returnData; }
-            function aggregate3(Call3[] calldata calls) external view returns (Result3[] memory returnData)
-        ]"#
-    );
+    pub async fn warm_start(&self) {
+        info!("🕯️ [PILLAR Z] Warm Start: Scanning historical logs for existing pools...");
+        
+        let pool_tx = self.pool_tx.clone();
+        let provider = self.provider.clone();
+        
+        // Background task to prevent blocking the main engine startup
+        tokio::spawn(async move {
+            let current_block = provider.get_block_number().await.unwrap_or_default();
+            let start_block = current_block.saturating_sub(50000); 
 
-    let multicall = IMulticall3::new(multicall_address, rpc_manager.get_next_provider());
-    let mut calls = Vec::new();
-    let mut pool_addr_map = FxHashMap::default(); // To map call index back to pool address
+            let v2_topic = fixed_bytes!("0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cd33e8bb5511a35a1d");
+            let v3_topic = fixed_bytes!("783cca1c0412dd0d695e784d03c4399881a4e8a1f8e136325997d9cf1673e728");
 
-    // Prepare calls for multicall
-    for (_idx, &pool_addr) in pool_addresses.iter().enumerate() {
-        let pool_contract = IPool::new(pool_addr, rpc_manager.get_next_provider());
-        if let Some(t0_calldata) = pool_contract.token_0().calldata() {
-            calls.push((pool_addr, true, t0_calldata));
-            pool_addr_map.insert(calls.len() - 1, (pool_addr, true)); // true for token0
-        }
-        if let Some(t1_calldata) = pool_contract.token_1().calldata() {
-            calls.push((pool_addr, true, t1_calldata));
-            pool_addr_map.insert(calls.len() - 1, (pool_addr, false)); // false for token1
-        }
-    }
+            let filter = Filter::new()
+                .from_block(start_block)
+                .to_block(current_block)
+                .event_signature(vec![v2_topic, v3_topic]);
 
-    // Process in chunks to avoid RPC size limits
-    for (chunk_idx, chunk_calls) in calls.chunks(crate::state_mirror::MULTICALL_BATCH_SIZE).enumerate() { 
-        if count.load(Ordering::Relaxed) >= limit { break; }
-
-        let chunk_offset = chunk_idx * crate::state_mirror::MULTICALL_BATCH_SIZE;
-        let mut multicall_requests = Vec::new();
-        for (target, allow_failure, calldata) in chunk_calls {
-            multicall_requests.push(Call3 {
-                target: *target,
-                allow_failure: *allow_failure,
-                call_data: calldata.clone(),
-            });
-        }
-
-        if multicall_requests.is_empty() { continue; }
-
-        // Pillar Z: Exponential Backoff for Bootstrap
-        let mut success = false;
-        let mut retries = 0;
-        while !success && retries < 3 {
-            match multicall.aggregate_3(multicall_requests.clone()).call().await {
-            Ok(results) => {
-                let mut pool_data: FxHashMap<Address, (Address, Address)> = FxHashMap::default();
-                for (i, result) in results.into_iter().enumerate() {
-                    if result.0 {
-                        if let Some(&(pool_addr, is_token0)) = pool_addr_map.get(&(chunk_offset + i)) {
-                            if result.1.len() >= 32 {
-                                let token_addr = Address::from_slice(&result.1[12..32]);
-                                let entry = pool_data.entry(pool_addr).or_default();
-                                if is_token0 { entry.0 = token_addr; } else { entry.1 = token_addr; }
-                            }
+            match provider.get_logs(&filter).await {
+                Ok(logs) => {
+                    let mut count = 0;
+                    for log in logs {
+                        if !log.topics().is_empty() && log.topics()[0] == v2_topic && log.topics().len() >= 3 {
+                            let token0 = Address::from_word(log.topics()[1]);
+                            let token1 = Address::from_word(log.topics()[2]);
+                            let pair = Address::from_word(B256::from_slice(&log.data().data[12..32]));
+                            let _ = pool_tx.send(NewPoolEvent::V2(V2PoolData { 
+                                token_0: token0, token_1: token1, pair, dex_name: DexName::UniswapV2 
+                            }));
+                            count += 1;
+                        } else if !log.topics().is_empty() && log.topics()[0] == v3_topic && log.topics().len() >= 4 {
+                            let token0 = Address::from_word(log.topics()[1]);
+                            let token1 = Address::from_word(log.topics()[2]);
+                            let fee = u32::from_be_bytes([0, log.data().data[29], log.data().data[30], log.data().data[31]]);
+                            let pool = Address::from_word(B256::from_slice(&log.data().data[44..64]));
+                            let _ = pool_tx.send(NewPoolEvent::V3(V3PoolData { 
+                                token_0: token0, token_1: token1, fee, pool, dex_name: DexName::UniswapV3 
+                            }));
+                            count += 1;
                         }
                     }
+                    info!("✅ [PILLAR Z] Warm Start complete. Injected {} pools into graph.", count);
                 }
-
-                for (pool_addr, (token_0, token_1)) in pool_data {
-                    if count.load(Ordering::Relaxed) >= limit { break; }
-
-                    // Pillar Z: Broadened Filter - Accept pools with any high-liquidity assets (AERO, DEGEN, etc.)
-                    let chain = Chain::Base; 
-                    let is_safe = crate::constants::SAFE_TOKENS.get(&chain)
-                        .map_or(false, |set| set.contains(&token_0) || set.contains(&token_1));
-
-                    if !token_0.is_zero() && !token_1.is_zero() && is_safe {
-                        let dex_name = if method == "allPairs" { DexName::UniswapV2 } else { DexName::Aerodrome };
-                        let _ = tx.send(NewPoolEvent::V2(V2PoolData { pair: pool_addr, token_0, token_1, dex_name }));
-                        count.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        debug!("🚫 [FILTER] Skipping pool {} - No CORE tokens (WETH/USDC/etc) found.", pool_addr);
-                    }
-                }
-                success = true;
+                Err(e) => error!("❌ [PILLAR Z] Warm Start log scan failed: {}", e),
             }
-            Err(e) => {
-                warn!("⚠️ Multicall for factory {:?} failed: {}", factory_addr, e);
-                retries += 1;
-                tokio::time::sleep(tokio::time::Duration::from_secs(1 * retries)).await;
-            }
-        }
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await; // Fast rotation
+        });
     }
-
-    Ok(())
 }

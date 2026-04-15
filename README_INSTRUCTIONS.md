@@ -57,5 +57,12 @@ forge create src/ShadowBot.sol:ShadowBot \
 - **Telegram Dashboard:** Aapka phone har trade aur 24h profit harvest ka notification dikhayega.
 - **Logs:** Terminal mein `[SIMULATION SUCCESS]` ka wait karein.
 
+## Phase 5: Sovereign Survival Rules
+
+1. **🛡️ 3x Gas Rule:** Sirf wahi trade fire karein jahan `Expected Profit > 3 * (L1_Data_Fee + L2_Execution_Fee)`.
+2. **🥷 Private Bundles Only:** Kabhi भी trade public mempool mein mat bhejo. Hamesha Flashbots ya Base PBH (Private Bundle Handler) use karo.
+3. **⚛️ Atomic Revert:** Zero-Loss Shield hamesha ON rakhein. Simulation mein `top_sim` profit से `MAX_BRANCH_LOSS_BPS` (10%) से ज़्यादा drop होते ही trade automatically kill हो जाएगी।
+4. **Global gRPC:** Sniper hamesha empty RAM ke saath ready rahega, Scouts global data stream karenge.
+
 ---
 **Lead Architect Note:** Aapka ₹200 ka budget sirf gas ke liye hai. Bot automatically Aave aur Balancer se Flash Loans lega, isliye liquidity ki tension na lein.

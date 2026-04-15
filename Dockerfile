@@ -1,38 +1,39 @@
-# Stage 1: Build stage
-FROM rust:1.88-bookworm as builder
+# --- STAGE 1: BUILD ENGINE ---
+FROM rust:1.77-slim-bookworm AS builder
 
-# Saare possible tools jo blockchain crates ko chahiye hote hain
+# Install build-essential tools for high-performance crates (secp2k1, alloy)
 RUN apt-get update && apt-get install -y \
-    clang \
-    llvm-dev \
-    libclang-dev \
-    cmake \
     pkg-config \
     libssl-dev \
-    build-essential \
+    cmake \
     protobuf-compiler \
+    g++ \
     && rm -rf /var/lib/apt/lists/*
-
-# Libclang path set karna zaroori hai c-kzg ke liye
-ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
 
 WORKDIR /usr/src/app
 COPY . .
 
-# Build the release binary
+# Build with high-level optimization (Release Mode)
+# Cargo.toml already has strip = true and lto = "fat" for nanosecond edge.
 RUN cargo build --release
 
-# Stage 2: Final Light image
+# --- STAGE 2: THE FORTRESS RUNTIME ---
 FROM debian:bookworm-slim
 
-# Runtime libraries install karo
+# Install minimal runtime dependencies (SSL for RPC, CA-Certs for HTTPS)
 RUN apt-get update && apt-get install -y \
-    libssl-dev \
+    libssl3 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Binary copy karo (Check karna binary ka naam 'the-sovereign-shadow' hi hai na)
-COPY --from=builder /usr/src/app/target/release/the-sovereign-shadow /usr/local/bin/bot
+WORKDIR /app
+COPY --from=builder /usr/src/app/target/release/the-sovereign-shadow /app/
 
-# Bot start command
-CMD ["bot"]
+# Pillar HF: Ensure the bot listens on the port provided by Hugging Face
+ENV PORT=7860
+EXPOSE 7860
+
+# Pillar MODE: Support for Double Space architecture (Space A: scout / Space B: sniper)
+ENV MODE=sniper
+
+CMD ["sh", "-c", "./the-sovereign-shadow ${MODE}"]

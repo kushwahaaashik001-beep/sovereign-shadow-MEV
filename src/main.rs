@@ -1,400 +1,406 @@
-#![allow(dead_code)]
-#![allow(unused_variables)]
-
-use the_sovereign_shadow::Opportunity;
-
 use the_sovereign_shadow::arbitrage_detector::{ArbitrageDetector, DetectorConfig};
 use the_sovereign_shadow::bundle_builder::{BundleBuilder, BundleBuilderConfig};
+use the_sovereign_shadow::bidding_engine::BiddingEngine;
 use the_sovereign_shadow::flash_loan_executor::FlashLoanExecutor;
 use the_sovereign_shadow::gas_feed::GasPriceFeed;
-use the_sovereign_shadow::inventory_manager::InventoryManager;
 use the_sovereign_shadow::nonce_manager::NonceManager;
 use the_sovereign_shadow::profit_manager::ProfitManager;
+use the_sovereign_shadow::inventory_manager::InventoryManager;
 use the_sovereign_shadow::state_mirror::StateMirror;
+use the_sovereign_shadow::discovery::Discovery;
 use the_sovereign_shadow::factory_scanner::{FactoryScanner, NewPoolEvent};
-use the_sovereign_shadow::models::DexName;
-use the_sovereign_shadow::discovery;
-use the_sovereign_shadow::state_simulator::StateSimulator; // Import StateSimulator
-use the_sovereign_shadow::bidding_engine::BiddingEngine;
+use the_sovereign_shadow::state_simulator::StateSimulator;
 use the_sovereign_shadow::mempool_listener::{MempoolListener, MempoolListenerConfig};
-use the_sovereign_shadow::utils::{CircuitBreaker, L1DataFeeCalculator, audit_log, cleanup_auditor_logs};
-use the_sovereign_shadow::constants;
+use the_sovereign_shadow::utils::{CircuitBreaker, L1DataFeeCalculator};
 use the_sovereign_shadow::rpc_manager::RpcManager;
+use the_sovereign_shadow::{constants, telemetry, WsProviderPool};
 use dotenv::dotenv;
-use ethers::prelude::*;
-use ethers::providers::{Provider, Ws};
-use ethers::signers::{LocalWallet, Signer};
-use ethers::types::BlockNumber;
+use alloy::providers::{ProviderBuilder, WsConnect, Provider};
+use alloy::signers::local::PrivateKeySigner;
+use alloy_primitives::{Address, U256};
 use std::error::Error;
-use std::str::FromStr; // Import FromStr
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
+use futures_util::StreamExt;
 use std::env;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
+use tokio_stream::wrappers::ReceiverStream;
+use dashmap::DashSet;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, filter::LevelFilter};
-use tokio::io::AsyncWriteExt; // Keep this, it's used for the HF health check
 
-use the_sovereign_shadow::WsProviderPool;
+// gRPC Imports
+pub mod hydra {
+    tonic::include_proto!("hydra");
+}
+use hydra::hydra_network_server::{HydraNetwork, HydraNetworkServer};
+use hydra::{RawOpportunity, Empty};
+use tonic::{transport::Server, Request, Response, Status, Streaming, metadata::MetadataValue};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    // Pillar A: Configuration Authority
-    // Hugging Face handles secrets via Env Vars, so we don't panic if .env is missing.
-    let _ = dotenv().ok();
+fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    let mode = args.get(1).map(|s| s.as_str()).unwrap_or("sniper");
 
-    // --- 📡 PILLAR HF: HEALTH-CHECK SERVER ---
-    // Keeps Hugging Face Space active by listening on the required port.
-    let hf_port = env::var("PORT").unwrap_or_else(|_| "7860".to_string());
-    let public_url = env::var("SHADOW_PUBLIC_URL").ok(); // Set this in HF Secrets: e.g., https://your-name-space.hf.space
-    
-    tokio::spawn(async move {
-        if let Ok(listener) = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", hf_port)).await {
-            info!("📡 [PILLAR HF] Health-Check Dashboard online at port {}", hf_port);
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
-                                <html><body style='font-family:sans-serif; background:#111; color:#0f0; padding:20px;'>\
-                                <h1>🛸 Sovereign Shadow MEV Engine</h1>\
-                                <p>Status: <b>ACTIVE</b></p>\
-                                <p>Mode: Hunting Alpha</p>\
-                                <p>Heartbeat: OK</p>\
-                                </body></html>";
-                let _ = stream.write_all(response.as_bytes()).await;
-            }
+    let core_ids = core_affinity::get_core_ids().expect("Failed to get core IDs");
+    let core_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(core_ids.len())
+        .enable_all()
+        .on_thread_start(move || {
+            let idx = core_counter.fetch_add(1, Ordering::SeqCst) % core_ids.len();
+            core_affinity::set_for_current(core_ids[idx]);
+        })
+        .build()?;
+
+    match mode {
+        "scout" => {
+            info!("👁️ Space A: Global Scout Mode Starting...");
+            runtime.block_on(run_scout())
         }
-    });
-
-    // --- 🛡️ PILLAR HF: SELF-WAKEUP LOOP ---
-    // Periodically pings itself to prevent Hugging Face from sleeping after 48h.
-    if let Some(url) = public_url {
-        tokio::spawn(async move {
-            let client = reqwest::Client::new();
-            let mut interval = tokio::time::interval(Duration::from_secs(600)); // Every 10 mins
-            loop {
-                interval.tick().await;
-                match client.get(&url).send().await {
-                    Ok(_) => debug!("💓 [PILLAR HF] Self-ping successful. Staying awake."),
-                    Err(e) => warn!("⚠️ [PILLAR HF] Self-ping failed: {}. Check SHADOW_PUBLIC_URL.", e),
-                }
-            }
-        });
-    } else {
-        warn!("⚠️ [PILLAR HF] SHADOW_PUBLIC_URL not set. Bot might go to sleep mode.");
-    }
-
-    // --- 🔍 SHADOW DIAGNOSTICS ---
-    println!("--- 🔍 SHADOW DIAGNOSTICS ---");
-    for (key, value) in std::env::vars() {
-        if key.starts_with("SHADOW_") || key.starts_with("RPC_") {
-            println!("{}: {}", key, value);
+        _ => {
+            info!("🎯 Space B: Sniper Brain Mode Starting...");
+            runtime.block_on(run_engine())
         }
     }
-    println!("----------------------------");
+}
 
-    // [STRICT AUTHORITY] Force load critical variables BEFORE any logic starts
-    let priv_key_raw = env::var("SHADOW_PRIVATE_KEY")
-        .expect("FATAL: SHADOW_PRIVATE_KEY missing from .env. Execution authority is required.");
-    
-    let manual_v2_factory: Option<Address> = env::var("SHADOW_V2_FACTORY")
-        .ok()
-        .and_then(|s| s.parse().ok());
-
-    let manual_aero_factory: Option<Address> = env::var("SHADOW_AERO_FACTORY")
-        .or_else(|_| env::var("AERODROME_FACTORY"))
-        .ok()
-        .and_then(|s| s.parse().ok());
-
-    info!("📂 Working Directory: {:?}", env::current_dir()?);
+async fn run_engine() -> Result<(), Box<dyn Error>> {
+    dotenv().ok();
 
     tracing_subscriber::registry()
         .with(fmt::layer())
-        .with(
-            EnvFilter::from_default_env()
-                .add_directive(LevelFilter::INFO.into()) // Change to LevelFilter::TRACE to see detailed arbitrage detection logs
-                // Silence noisy ethers transport reconnect spam
-                .add_directive("ethers_providers::rpc::transports::ws=warn".parse().unwrap()),
-        )
+        .with(EnvFilter::from_default_env().add_directive(LevelFilter::INFO.into()))
         .init();
 
-    info!("🛸 Sovereign Shadow MEV Engine — INITIALIZING BEAST MODE");
+    info!("🛸 Sovereign Shadow MEV Engine — BEAST MODE ONLINE");
 
-    // ── Chain config ──────────────────────────────────────────────────────────
-    let chain_name = env::var("SHADOW_CHAIN")
-        .or_else(|_| env::var("CHAIN"))
-        .unwrap_or_else(|_| "base".to_string());
+    let chain_name = env::var("CHAIN").unwrap_or_else(|_| "base".to_string());
     let chain = match chain_name.as_str() {
-        "base"     => Chain::Base,
-        "arbitrum" => Chain::Arbitrum,
-        _          => Chain::Mainnet,
+        "base"     => the_sovereign_shadow::models::Chain::Base,
+        "arbitrum" => the_sovereign_shadow::models::Chain::Arbitrum,
+        _          => the_sovereign_shadow::models::Chain::Mainnet,
     };
+    info!("⛓️  Chain: {:?}", chain);
 
-    // Pillar A: Intelligent Provider Discovery
-    // Scans for individual secrets (RPC_HTTPS_1, RPC_HTTPS_2, etc.) to maximize rate limits on HF.
-    let http_urls = {
-        let mut urls = Vec::new();
-        for i in 1..=10 {
-            if let Ok(u) = env::var(format!("RPC_HTTPS_{}", i)) {
-                let u = u.trim().to_string();
-                if !u.is_empty() && !urls.contains(&u) { urls.push(u); }
+    // Pillar S: Strategic Env Loading - Sniper needs execution keys
+    // Logic: Split by comma to support multiple keys (Rotation logic from v1.0)
+    // Fallback logic for variable names (checks for SHADOW_WS_URL or SHADOW_WS_URL_1)
+    let wss_raw = env::var("SHADOW_WS_URL")
+        .or_else(|_| env::var("SHADOW_WS_URL_1"))
+        .expect("🚀 Sniper needs SHADOW_WS_URL or SHADOW_WS_URL_1");
+    
+    let wss_urls: Vec<String> = wss_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
+
+    let rpc_raw = env::var("SHADOW_RPC_URL")
+        .or_else(|_| env::var("SHADOW_RPC_URL_1"))
+        .expect("🚀 Sniper needs SHADOW_RPC_URL or SHADOW_RPC_URL_1");
+
+    let http_urls: Vec<String> = rpc_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
+
+    let priv_key_raw = env::var("SHADOW_PRIVATE_KEY").expect("🚀 Sniper Mode needs SHADOW_PRIVATE_KEY");
+    let priv_key = priv_key_raw.trim().trim_start_matches("0x");
+
+    // Initialize WSS Provider Pool for parallel listening
+    let provider_futures = wss_urls.iter().map(|url| {
+        let url = url.clone();
+        async move {
+            let ws = WsConnect::new(url.clone());
+            match ProviderBuilder::new().on_ws(ws).await {
+                Ok(p) => Some(Arc::new(p.boxed())),
+                Err(e) => { error!("❌ [INFRA] Connection failed {}: {}", url, e); None }
             }
         }
-        let raw = env::var("SHADOW_RPC_URLS").or_else(|_| env::var("SHADOW_RPC_URL")).unwrap_or_default();
-        for u in raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-            if !urls.contains(&u) { urls.push(u); }
-        }
-        if urls.is_empty() {
-            return Err(Box::<dyn Error>::from("FATAL: No HTTP providers found. Check Hugging Face Secrets (RPC_HTTPS_1..4)."));
-        }
-        urls
-    };
+    });
+    let ws_providers: Vec<Arc<the_sovereign_shadow::WsProvider>> = futures::future::join_all(provider_futures).await.into_iter().flatten().collect();
 
-    let wss_urls = {
-        let mut urls = Vec::new();
-        for i in 1..=10 {
-            if let Ok(u) = env::var(format!("RPC_WSS_{}", i)) {
-                let u = u.trim().to_string();
-                if !u.is_empty() && !urls.contains(&u) { urls.push(u); }
-            }
-        }
-        let raw = env::var("SHADOW_WS_URLS").or_else(|_| env::var("SHADOW_WS_URL")).unwrap_or_default();
-        for u in raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-            if !urls.contains(&u) { urls.push(u); }
-        }
-        if urls.is_empty() {
-            return Err(Box::<dyn Error>::from("FATAL: No WSS providers found. Check Hugging Face Secrets (RPC_WSS_1..4)."));
-        }
-        urls
-    };
-
-    // [DYNAMIC SCALING] Automatically optimize batch size based on unique provider count
-    let batch_size: usize = env::var("SHADOW_BATCH_SIZE")
-        .ok().and_then(|v| v.parse().ok())
-        .unwrap_or(if http_urls.len() > 1 { http_urls.len() * 3 } else { 4 });
-
-    // [PRODUCTION] Bootstrap limit for discovery
-    let bootstrap_count: usize = env::var("SHADOW_POOL_BOOTSTRAP_COUNT")
-        .ok().and_then(|v| v.parse().ok())
-        .unwrap_or(3500); 
+    if ws_providers.is_empty() { return Err("No valid WSS endpoints".into()); }
+    let ws_provider_pool = Arc::new(WsProviderPool::new(ws_providers));
     
-    info!("🛠️ [CONSTRAINTS] Nodes: HTTP:{} / WSS:{} | Batch: {} | Bootstrap: {}", 
-        http_urls.len(), wss_urls.len(), batch_size, bootstrap_count);
-
-    let priv_key     = priv_key_raw.trim().trim_start_matches("0x");
-
-    // [FORCE LOAD] Strictly use SHADOW_EXECUTOR_ADDRESS from .env
-    let executor_address: Address = env::var("SHADOW_EXECUTOR_ADDRESS")
-        .expect("FATAL: SHADOW_EXECUTOR_ADDRESS missing from .env. Deploy contract first.")
-        .parse()
-        .expect("FATAL: Invalid SHADOW_EXECUTOR_ADDRESS hex format");
+    // Initialize HTTP RPC Manager for rotated simulations
+    let rpc_manager = Arc::new(RpcManager::new(http_urls));
     
-    // ── Providers with Failover (Phase B) ─────────────────────────────────────
-    let mut ws_provider_option: Option<Provider<Ws>> = None;
-    for url in &wss_urls {
-        match Provider::<Ws>::connect(url).await {
-            Ok(p) => {
-                info!("✅ Connected to WSS provider: {}", url);
-                ws_provider_option = Some(p);
-                break;
-            }
-            Err(e) => {
-                warn!("⚠️ Failed to connect to WSS provider {}: {:?}", url, e);
-            }
-        }
-    }
+    // Initialize Telemetry Nervous System
+    let (tele_tx, tele_rx) = mpsc::unbounded_channel();
+    let telemetry_handle = Arc::new(telemetry::TelemetryHandle::new(tele_tx));
+    let tele_handle_for_loop = telemetry_handle.clone();
+    tokio::spawn(async move {
+        telemetry::run_telemetry_loop(tele_rx).await;
+    });
 
-    let ws_provider = ws_provider_option.ok_or_else(|| {
-        error!("FATAL: Could not connect to any WSS provider. Check SHADOW_WS_URLS in .env");
-        Box::<dyn Error>::from("No WSS provider available")
-    })?;
-    let ws_provider = Arc::new(ws_provider);
+    // Primary provider for setup (uses the first available key)
+    let ws_provider = ws_provider_pool.next();
+    let http_provider = rpc_manager.get_next_provider();
 
-    // Create a pool of WSS providers for block listener and factory scanner
-    let mut ws_providers_for_pool = Vec::new();
-    for url in &wss_urls {
-        if let Ok(p) = Provider::<Ws>::connect(url).await {
-            ws_providers_for_pool.push(Arc::new(p));
-        }
-    }
-    let ws_provider_pool = Arc::new(WsProviderPool::new(ws_providers_for_pool));
+    let executor_address: Address = env::var("EXECUTOR_ADDRESS")
+        .unwrap_or_default().parse().unwrap_or(Address::ZERO);
 
-    // ── HTTP Provider Manager (Round-Robin for Rate Limit Avoidance) ──────────
-    let http_rpc_manager = Arc::new(RpcManager::new(http_urls));
-    
-    let chain_id = ws_provider.get_chainid().await?.as_u64();
+    let chain_id = ws_provider.get_chain_id().await?;
+    info!("🔗 Chain ID: {}", chain_id);
 
-    // ── Wallet ────────────────────────────────────────────────────────────────
-    let wallet = LocalWallet::from_str(priv_key).map_err(|e| { // Use `priv_key` directly
-        error!("FATAL: Private Key parsing failed. Check SHADOW_PRIVATE_KEY format in .env");
-        e
-    })?.with_chain_id(chain_id);
-    
-    info!("👛 MEV Wallet Address: {:?}", wallet.address());
+    let wallet = PrivateKeySigner::from_str(priv_key)?;
+    info!("👛 Wallet: {:?}", wallet.address());
 
-    // ── Core infrastructure ───────────────────────────────────────────────────
-    // [PILLAR V] Tightened Circuit Breaker for ₹200 Budget
-    // Max 3 failures instead of 5, and 60s cooldown to analyze "Why it failed".
-    let circuit_breaker = Arc::new(CircuitBreaker::new(3, 60));
-    let l1_fee_calc     = Arc::new(L1DataFeeCalculator::new(http_rpc_manager.get_next_provider())); // This still uses HTTP provider
-    let gas_feed        = Arc::new(GasPriceFeed::new(ws_provider_pool.clone(), chain).await); // [FIX] Use WsProviderPool here
+    let circuit_breaker = Arc::new(CircuitBreaker::new(5, 30));
+    let gas_feed = Arc::new(GasPriceFeed::new(ws_provider_pool.clone(), chain).await);
 
-    // Multicall3 — same address on all chains
-    let multicall3: Address = "0xcA11bde05977b3631167028862bE2a173976CA11".parse().expect("Invalid Multicall3 address");
-
-    // ── Pillar B: State Mirror ────────────────────────────────────────────────
-    let state_mirror = StateMirror::new(ws_provider.clone(), http_rpc_manager.clone(), multicall3);
-
-    // ── Bidding Engine (Pillar I) ──
+    let state_mirror = StateMirror::new();
     let bidding_engine = Arc::new(BiddingEngine::new(state_mirror.clone()));
 
-
-    // ── Pillar Z: Factory Scanner ─────────────────────────────────────────────
     let (pool_tx, _) = broadcast::channel::<NewPoolEvent>(2048);
     {
-        let scanner = Arc::new(FactoryScanner::new(ws_provider_pool.clone(), pool_tx.clone(), chain)); // Use WsProviderPool and pass chain
+        let scanner = Arc::new(FactoryScanner::new(ws_provider_pool.clone(), pool_tx.clone(), chain));
         tokio::spawn(async move { scanner.run().await; });
     }
 
-    // ── Nonce Managers ────────────────────────────────────────────────────────
-    let nonce_manager      = Arc::new(NonceManager::new(ws_provider.clone(), wallet.address()).await?);
-    let nonce_manager_http = Arc::new(NonceManager::new(http_rpc_manager.get_next_provider(), wallet.address()).await?);
+    let nonce_manager = Arc::new(NonceManager::new(ws_provider.clone(), wallet.address()).await?);
 
-    // ── Pillar E: Bundle Builder ──────────────────────────────────────────────
     let relays = vec![
         "https://relay.flashbots.net".to_string(),
         "https://rpc.beaverbuild.org/".to_string(),
-        "https://rpc.titanbuilder.xyz/".to_string(),
     ];
-
     let l2_rpcs: Vec<String> = env::var("PRIVATE_RPCS")
-        .unwrap_or_default()
-        .split(',')
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect();
+        .unwrap_or_default().split(',')
+        .filter(|s| !s.is_empty()).map(String::from).collect();
 
-    let identity_key_raw = env::var("FLASHBOTS_IDENTITY_KEY").unwrap_or_else(|_| priv_key_raw.clone());
-    let identity_key     = identity_key_raw.trim().trim_start_matches("0x");
-    let identity_wallet  = LocalWallet::from_str(identity_key)?;
+    let identity_key_raw = env::var("FLASHBOTS_IDENTITY_KEY").unwrap_or(priv_key_raw.clone());
+    let identity_wallet = PrivateKeySigner::from_str(identity_key_raw.trim().trim_start_matches("0x")).unwrap_or(wallet.clone());
 
-    let state_simulator = Arc::new(StateSimulator::new(state_mirror.clone(), executor_address));
+    let state_simulator = Arc::new(StateSimulator::new(state_mirror.clone()));
 
     let bundle_builder = Arc::new(BundleBuilder::new(
         BundleBuilderConfig {
             chain_id,
             chain,
-            signer:                   wallet.clone(),
-            identity_signer:          identity_wallet,
+            signer:             wallet.clone(),
+            identity_signer:    identity_wallet,
             executor_address,
-            min_profit_eth:           U256::from(10u64.pow(12)), // 0.000001 ETH (₹2-3 profit is enough to start scaling)
+            min_profit_eth:     U256::from(10u64.pow(14)),
             relays,
-            l2_private_rpcs:          l2_rpcs.clone(),
-            base_bribe_percent:       50, // Pillar I: Survival Mode Bribe (Greedy Miner Filter)
-            max_gas_price_gwei:       500,
-            enable_simulation:        true,
-            use_flashbots_simulation: chain == Chain::Mainnet,
-            check_flash_loan:         false,
-            relay_timeout_ms:         500,
-            stealth_jitter:           true,
-            use_raw_encoding:         false,
-            nonce_recovery_blocks:    3,
+            l2_private_rpcs:    l2_rpcs.clone(),
+            base_bribe_percent: 90,
+            max_gas_price_gwei: 100,
+            enable_simulation: true,
+            use_flashbots_simulation: false,
+            check_flash_loan: false,
+            relay_timeout_ms:   500,
+            stealth_jitter:     true,
+            use_raw_encoding: false,
+            nonce_recovery_blocks: 10,
             max_consecutive_failures: 5,
-            pause_duration_secs:      30,
-            ai_strategy:              None,
-            telemetry_tx:             None,
+            pause_duration_secs: 60,
+            ai_strategy: None,
+            telemetry_tx: Some(tele_handle_for_loop),
         },
-        http_rpc_manager.get_next_provider(),
-        nonce_manager_http,
+        ws_provider.clone(),
+        nonce_manager.clone(),
         circuit_breaker.clone(),
-            state_simulator.clone(),
+        state_simulator.clone(),
     ).await?);
 
-    // ── Pillar M: Flash Loan Executor ─────────────────────────────────────────
-    let flash_executor = Arc::new(FlashLoanExecutor::new(
-        ws_provider.clone(),
-        http_rpc_manager.get_next_provider(),
-        wallet.clone(), // This wallet is used for signing, not for RPC.
-        executor_address,
-        l2_rpcs,
-        U256::from(10u64.pow(12)),       // 0.000001 ETH min profit
-        chain == Chain::Mainnet,
-        Some(bundle_builder.clone()),
-        50,                              // Pillar I: Keep 50% profit for the Vault
-        U256::from(1_000_000_000u64),    // 1 gwei base priority
-        U256::from(500_000_000_000u64),  // 500 gwei max gas
-        nonce_manager,
-        circuit_breaker.clone(),
-        l1_fee_calc.clone(),
-        state_simulator,
-        bidding_engine.clone(),
-    ).await?);
-
-    // ── Pillar P: Profit Manager ──────────────────────────────────────────────
-    let profit_manager = Arc::new(ProfitManager::new(
-        ws_provider.clone(),
-        wallet.clone(),
-        U256::from_dec_str("11500000000000000")?, // 💰 PILLAR P: Target $30 threshold for Cold Vault harvest
-        env::var("COMPOUNDING_TARGET_ADDRESS").ok().and_then(|s| s.parse().ok()),
-    ));
-
-    // ── Pillar J: Inventory Manager ───────────────────────────────────────────
-    let inventory_manager = Arc::new(InventoryManager::new(
-        ws_provider.clone(),
-        wallet.clone(),
-        l1_fee_calc.clone(),
-        chain,
-    ));
-
+    // Pillar S: Self-Healing Memory Management (8GB RAM Safety)
     {
-        let im       = inventory_manager.clone();
-        let provider = ws_provider.clone();
-        let addr     = wallet.address();
-        let cb       = circuit_breaker.clone();
+        let mirror = state_mirror.clone();
+        let provider = http_provider.clone(); // Using HTTP for heavy batch reads
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(3600));
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop { interval.tick().await; mirror.prune_stale_pools(100); }
+        });
+
+        // Pillar B: Background Batch State Sync (Multicall3)
+        // This fills the gap: keeping 3000+ pools synchronized in the background
+        let mirror_sync = state_mirror.clone();
+        let provider_sync = provider.clone();
+        tokio::spawn(async move {
+            info!("🔄 [STATE] Background Multicall Sync started");
+            // Initial heavy sync
+            let _ = mirror_sync.sync_all_pools_multicall(provider_sync.clone()).await;
+            
+            let mut interval = tokio::time::interval(Duration::from_secs(4)); // Every ~2 blocks on Base
             loop {
                 interval.tick().await;
-                if let Ok(bal) = provider.get_balance(addr, None).await {
-                    cb.update_balance(bal);
-                    let eth = bal.as_u128() as f64 / 1e18;
-                    if eth < 0.001 {
-                        warn!("⚠️ [WALLET] LOW BALANCE: {:.6} ETH — bot may not execute!", eth);
-                        the_sovereign_shadow::utils::send_telegram_msg(&format!("⚠️ *LOW BALANCE ALERT!* ⚠️\n\nWallet balance: `{:.6} ETH`\nPlease top up to avoid execution halts.", eth));
-                    } else {
-                        info!("[Pillar J] Wallet: {:.6} ETH", eth);
-                    }
-                }
-
-                // Pillar J: Autonomous Dust Sweep
-                if let Some(tokens) = constants::SAFE_TOKENS.get(&chain) {
-                    let _ = im.auto_sweep(tokens.clone()).await;
-                }
-
-                // [PILLAR J] Unstoppable Scaling: Convert WETH profits to ETH gas if needed
-                if let Err(e) = im.unwrap_weth_if_needed().await {
-                    warn!("⚠️ [BOOTSTRAP] WETH Unwrap failed: {:?}", e);
+                if let Err(e) = mirror_sync.sync_all_pools_multicall(provider_sync.clone()).await {
+                    error!("❌ [STATE SYNC] Multicall batch sync failed: {}", e);
                 }
             }
         });
     }
 
-    // ── Pillar A: Mempool Listener ────────────────────────────────────────────
-    // [FIX] Strict P2P Scheme Enforcement (https -> wss)
-    let sequencer_endpoint = env::var("SHADOW_SEQUENCER_URL").ok().map(|url| {
-        if url.starts_with("https://") { url.replace("https://", "wss://") }
-        else if url.starts_with("http://") { url.replace("http://", "ws://") }
-        else { url }
-    });
+    // Pillar E: Real-time Block Tracker & State Mirror Sync (Heartbeat)
+    // This task ensures all bundles target the correct next block
+    {
+        let cb_sync = circuit_breaker.clone();
+        let mirror_sync = state_mirror.clone();
+        let bb_sync = bundle_builder.clone();
+        let ws_pool = ws_provider_pool.clone();
+        tokio::spawn(async move {
+            loop {
+                let provider = ws_pool.next();
+                if let Ok(sub) = provider.subscribe_blocks().await {
+                    let mut stream = sub.into_stream();
+                    while let Some(block) = stream.next().await {
+                        let block_number = block.header.number;
+                        let base_fee = U256::from(block.header.base_fee_per_gas.unwrap_or_default());
+                        let timestamp = block.header.timestamp;
+                        
+                        mirror_sync.sync_block(block_number, base_fee, timestamp).await;
+                        cb_sync.record_sequencer_drift(timestamp); // Pillar T: Track L2 Sequencer Lag
+                        // Bug Fix: Wire block tracker to ensure bundle target_block is correct
+                        bb_sync.block_tracker.update(block_number);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        });
+    }
 
-    let (mempool_listener, mempool_rx, priority_rx) = MempoolListener::new(MempoolListenerConfig {
-        endpoints:          wss_urls.clone(), // Use ALL WSS keys for maximum coverage
+    let l1_calc = L1DataFeeCalculator::new(ws_provider.clone());
+    {
+        let l1 = l1_calc.clone();
+        let c = chain;
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = l1.refresh_scalars(c).await {
+                    error!("❌ Failed to refresh L1 scalars: {}", e);
+                }
+                // HIGH-SPEED: Refresh every block (2s) to track volatility accurately.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+    }
+
+    let flash_executor = Arc::new(FlashLoanExecutor::new(
+        ws_provider.clone(),
+        executor_address,
+        U256::from(10u64.pow(14)),
+        Some(bundle_builder.clone()),
+        90,
+        nonce_manager.clone(),
+        circuit_breaker.clone(),
+        state_simulator.clone(),
+        bidding_engine.clone(),
+        l1_calc.clone(),
+    ).await?);
+
+    let profit_manager = Arc::new(ProfitManager::new(
+        http_provider.clone(),
+        wallet.clone(),
+        nonce_manager.clone(),
+        l1_calc.clone(),
         chain,
-        min_gas_price_gwei: 0, // Base L2: capture all txs
-        sequencer_endpoint: sequencer_endpoint.clone(),
-        worker_count: 4,
-        fetcher_count: 4,
-        ..Default::default()
-    }).await?;
+        U256::from_str("1000000000000000")?, // ₹200 survival threshold (0.001 ETH)
+        env::var("COMPOUNDING_TARGET_ADDRESS").ok().and_then(|s| s.parse().ok())
+    ));
+
+    {
+        let pm = profit_manager.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(86400));
+            loop { interval.tick().await; pm.report_harvest().await; }
+        });
+    }
+
+    let inventory_manager = Arc::new(InventoryManager::new(
+        http_provider.clone(),
+        wallet.clone(),
+        executor_address,
+        chain,
+        circuit_breaker.clone(),
+        nonce_manager.clone(),
+        gas_feed.clone(),
+        l1_calc.clone(), // Fix: Pass all 8 arguments to constructor
+    ));
+
+    // Pillar Z: Warm Start Discovery
+    // Bug Fix: Must run warm_start before hunting to populate the pool graph
+    {
+        let discovery = Discovery::new(ws_provider.clone(), pool_tx.clone(), chain);
+        info!("🔍 [PILLAR Z] Initializing Warm Start (Scanning historical liquidity)...");
+        discovery.warm_start().await;
+    }
+
+    // Pillar Q: Bootstrap Protocol (Final Pre-flight)
+    info!("🛠️ [PILLAR Q] Executing Bootstrap Protocol...");
+    {
+        // 1. Check Survival Budget
+        inventory_manager.ensure_ready().await?;
+        
+        // 2. Initial State Mirror Sync
+        let _ = state_mirror.sync_all_pools_multicall(http_provider.clone()).await;
+        
+        // 3. RPC Latency check
+        let start = Instant::now();
+        let _ = ws_provider.get_block_number().await?;
+        let latency = start.elapsed().as_millis();
+        info!("📡 [BOOTSTRAP] RPC Latency: {}ms", latency);
+        if latency > 500 { warn!("⚠️ [BOOTSTRAP] High latency detected on primary RPC!"); }
+    }
+    info!("✅ [PILLAR Q] Bootstrap Sequence Complete. System is STABLE.");
+
+    {
+        let inv = inventory_manager.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                let _ = inv.unwrap_weth_if_needed().await;
+                if let Some(tokens) = constants::SAFE_TOKENS.get(&chain) {
+                    let _ = inv.auto_sweep(tokens.clone()).await;
+                }
+            }
+        });
+    }
+
+    let (mempool_listener, mut mempool_rx, _priority_rx) = MempoolListener::new(
+        MempoolListenerConfig {
+            endpoints: wss_urls,
+            chain,
+            min_gas_price_gwei: 0,
+            ..Default::default()
+        },
+        None,
+    ).await?;
+
+    let p2p_alloy_tx = mempool_listener.p2p_tx();
+
+    // Pillar T: Global Hydra Nervous System - gRPC Sniper Server
+    let (grpc_swap_tx, mut grpc_swap_rx) = mpsc::channel(4096);
+    let sniper_service = HydraNetworkImpl { tx: grpc_swap_tx };
+    
+    // Fast Auth: Pre-load token to avoid env lookups during hot-path
+    // Robust loading: Checks for TOKEN or KEY variations
+    let auth_token = env::var("SHADOW_AUTH_TOKEN").or_else(|_| env::var("ACCESS_TOKEN")).expect("🚀 SHADOW_AUTH_TOKEN required");
+    let token_metadata = MetadataValue::from_str(&auth_token)?;
+
+    let interceptor = move |req: Request<()>| {
+        match req.metadata().get("x-shadow-token").or_else(|| req.metadata().get("authorization")) {
+            Some(t) if t == token_metadata => Ok(req),
+            _ => Err(Status::unauthenticated("Invalid Shadow Token")),
+        }
+    };
+
+    // Pillar HF: Dynamic Port Discovery for Hugging Face Spaces
+    let grpc_port = env::var("PORT").unwrap_or_else(|_| "50051".to_string());
+    let grpc_addr = format!("0.0.0.0:{}", grpc_port).parse().expect("Invalid PORT format");
+
+    info!("🌐 [SNIPER] gRPC Nervous System online at {} (Binary Proto-Stream)", grpc_addr);
+    tokio::spawn(async move {
+        let svc = HydraNetworkServer::with_interceptor(sniper_service, interceptor);
+        if let Err(e) = Server::builder()
+            .add_service(svc)
+            .serve(grpc_addr)
+            .await {
+                error!("❌ [HYDRA] gRPC Server failed: {}", e);
+            }
+    });
 
     tokio::spawn(async move {
         if let Err(e) = mempool_listener.run().await {
@@ -402,35 +408,121 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    // ── Swap channel: mempool → detector ─────────────────────────────────────
     let (swap_tx, swap_rx) = mpsc::channel(4096);
-    let (priority_tx, priority_rx_chan) = mpsc::channel(1024);
 
+    // Global Deduplication Cache & Shared Decoder
+    let decoder = Arc::new(the_sovereign_shadow::universal_decoder::UniversalDecoder::new());
+    let seen_hashes = Arc::new(DashSet::with_capacity_and_hasher(100_000, std::hash::BuildHasherDefault::<rustc_hash::FxHasher>::default()));
+
+    // Nerve Bridge A: Connects Local Listeners to the Brain with Deduplication
+    let s_tx = swap_tx.clone();
+    let seen_hashes_local = seen_hashes.clone();
+    let mirror_bridge = state_mirror.clone();
     tokio::spawn(async move {
-        let mut m_rx = mempool_rx;
-        let mut p_rx = priority_rx;
-        loop {
-            tokio::select! {
-                Some(event) = p_rx.recv() => {
-                    let _ = priority_tx.try_send(event);
-                }
-                Some(event) = m_rx.recv() => {
-                    let _ = swap_tx.try_send(event);
+        while let Some(event) = mempool_rx.recv().await {
+            // Pillar U: Zero-Cost Deduplication. Skip if already captured via gRPC/P2P.
+            if !seen_hashes_local.insert(event.tx_hash) {
+                continue;
+            }
+            
+            // Pillar W: Feed organic traders into the registry
+            mirror_bridge.record_trader(event.swap_info.router, event.sender);
+
+            if seen_hashes_local.len() > 100_000 { seen_hashes_local.clear(); }
+
+            let _ = s_tx.send(event).await;
+        }
+    });
+
+    // Nerve Bridge B: Connects Global Scouts to the Brain
+    let s_tx_grpc = swap_tx.clone();
+    let seen_hashes_grpc = seen_hashes.clone();
+    let decoder_grpc = decoder.clone();
+    tokio::spawn(async move {
+        while let Some(raw) = grpc_swap_rx.recv().await {            
+            let to = alloy_primitives::Address::from_slice(&raw.pool_address);
+            let tx_hash = alloy_primitives::B256::from_slice(&raw.tx_hash);
+
+            // Pillar U: Global Deduplication. First scout (Asia/Europe/US) to send data wins.
+            if !seen_hashes_grpc.insert(tx_hash) {
+                continue;
+            }
+            if seen_hashes_grpc.len() > 100_000 { seen_hashes_grpc.clear(); }
+
+            // Real-time Gas Integration: Use actual gas price observed by the Scout
+            let effective_gas_price = alloy_primitives::U256::from(raw.gas_price);
+
+            let payload = bytes::Bytes::from(raw.data_payload); // Take ownership of gRPC buffer
+
+            let decode_tx = the_sovereign_shadow::universal_decoder::DecodeTx {
+                to: Some(to),
+                value: alloy_primitives::U256::ZERO, 
+                input: payload.clone(),
+            };
+
+            // Sniper brain decodes the raw payload filtered by Global Scouts
+            let swaps = decoder_grpc.decode(&decode_tx);
+            for swap in swaps {
+                let is_whale = swap.amount_in > alloy_primitives::U256::from(10u128 * 10u128.pow(18)); // 10 ETH Whale
+                let event = the_sovereign_shadow::mempool_listener::SwapEvent {
+                    tx_hash,
+                    sender: alloy_primitives::Address::ZERO, 
+                    swap_info: swap,
+                    effective_gas_price,
+                    received_at: Instant::now(),
+                    is_whale_trigger: is_whale, 
+                    mempool_tx: Some(the_sovereign_shadow::models::MempoolTx {
+                        data: alloy_primitives::Bytes(payload.clone()),
+                        hash: tx_hash,
+                        to: Some(to),
+                    }),
+                };
+                let _ = s_tx_grpc.send(event).await;
+            }
+        }
+    });
+
+    the_sovereign_shadow::p2p_engine::start_p2p_bridge(p2p_alloy_tx);
+
+    let mut detector_config = DetectorConfig::default();
+    detector_config.chain = chain;
+    detector_config.executor_address = executor_address;
+    detector_config.bribe_percent = 60;
+    detector_config.scanner_threads = 16;
+    detector_config.min_profit_wei = U256::from(10u64.pow(13));
+
+    let mut pool_rx = pool_tx.subscribe();
+
+    // Pillar Z: Proactive Pool Initialization Task
+    let mirror_init = state_mirror.clone();
+    let provider_init = ws_provider.clone();
+    tokio::spawn(async move {
+        while let Ok(event) = pool_rx.recv().await {
+            let pool_addr = match event {
+                NewPoolEvent::V2(ref d) => d.pair,
+                NewPoolEvent::V3(ref d) => d.pool,
+            };
+
+            // Pillar L: Proactive Bytecode Warming for X-Ray Scanning
+            let m = mirror_init.clone();
+            let p = provider_init.clone();
+            tokio::spawn(async move {
+                m.fetch_and_cache_bytecode(pool_addr, p).await;
+            });
+
+            if let NewPoolEvent::V2(data) = event {
+                if data.dex_name == the_sovereign_shadow::models::DexName::Aerodrome {
+                    let mirror = mirror_init.clone();
+                    mirror.update_aerodrome_stable(data.pair, true);
                 }
             }
         }
     });
 
-    // ── Pillar C/D: Arbitrage Detector ───────────────────────────────────────
-    let mut detector_config        = DetectorConfig::default();
-    detector_config.chain          = chain;
-    detector_config.executor_address = executor_address;
-    detector_config.bribe_percent  = 50; // Pillar I: Consolidate to 50% across engine
-    detector_config.scanner_threads = 16;
-    detector_config.min_profit_wei = U256::from(1u64); // ⚡ 1-WEI SENSITIVITY
-    detector_config.pool_limit = bootstrap_count;
+    let pool_rx_for_detector = pool_tx.subscribe();
+    let (priority_tx_dummy, priority_rx_dummy) = mpsc::channel::<the_sovereign_shadow::mempool_listener::SwapEvent>(256);
+    drop(priority_tx_dummy);
 
-    let pool_rx = pool_tx.subscribe();
     let (detector, mut opp_rx, force_tx) = ArbitrageDetector::new(
         detector_config,
         ws_provider.clone(),
@@ -438,190 +530,117 @@ async fn main() -> Result<(), Box<dyn Error>> {
         gas_feed.clone(),
         bidding_engine.clone(),
         swap_rx,
-        priority_rx_chan,
-        pool_rx,
+        priority_rx_dummy,
+        pool_rx_for_detector,
     ).await;
 
-    // Get a clone of the state before the detector is moved into the background task
-    let detector_state = detector.state.clone();
-
-    // [GHOST ACTIVATION] Pillar A+ P2P Sequencer Handler
-    if let Some(ref p2p_url) = sequencer_endpoint {
-        let mirror_clone = state_mirror.clone();
-        let f_tx = force_tx.clone();
-        let url = p2p_url.clone();
-        tokio::spawn(async move {
-            mirror_clone.spawn_p2p_gossip_handler(url, Some(f_tx)).await;
-        });
-    }
-
-    // Block-driven mirror sync (every block) - Link to Detector
+    // Pillar S: Real-time State Mirror Syncing (The Lifeblood)
     {
-        let mirror        = state_mirror.clone();
-        let ws_pool_clone = ws_provider_pool.clone(); // Use the WsProviderPool
-        let cb            = circuit_breaker.clone();
-        let be            = bidding_engine.clone();
-        let f_tx          = force_tx.clone();
+        let mirror = state_mirror.clone();
+        let provider = ws_provider.clone();
+        let f_tx = force_tx.clone();
+
+        // Pillar S: Pre-compute topics to avoid string parsing in the hot loop
+        let v2_sync_topic = alloy_primitives::fixed_bytes!("0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
+        let v3_swap_topic = alloy_primitives::fixed_bytes!("0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
+        
         tokio::spawn(async move {
-            loop {
-                match ws_pool_clone.next().subscribe_blocks().await { // Use next provider from pool
-                    Ok(mut stream) => {
-                        info!("✅ [PILLAR A] Block stream active.");
-                while let Some(block) = stream.next().await {
-                    let block_num = block.number.unwrap_or_default().as_u64();
-                    mirror.mark_dirty();
-                    if block_num % 100 == 0 { mirror.prune_stale_pools(500); }
-                    be.reset_pressure();
-                    tokio::time::sleep(Duration::from_millis(200)).await; // Delay to let RPC state catch up
-                    mirror.sync(Some(block.clone())).await;
-                    let _ = f_tx.send(()); // Zero-latency snapshot trigger
-                    cb.record_sequencer_drift(block.timestamp.as_u64());
-                }
-                        warn!("⚠️ [PILLAR A] Block stream ended unexpectedly. Reconnecting...");
+            let filter = alloy::rpc::types::Filter::new()
+                .event_signature(vec![v2_sync_topic, v3_swap_topic]);
+
+            let mut sub = provider.subscribe_logs(&filter).await.expect("Failed to sub to state logs");
+            info!("📡 [STATE] Real-time Mirror Syncing active (V2 Sync & V3 Swap)");
+
+            while let Ok(log) = sub.recv().await {
+                let pool_addr = log.address();
+                if !log.topics().is_empty() && log.topics()[0] == v2_sync_topic {
+                    // V2 Sync Event: [reserve0, reserve1] in data
+                    if log.data().data.len() >= 64 {
+                        let r0 = alloy_primitives::U256::from_be_slice(&log.data().data[0..32]);
+                        let r1 = alloy_primitives::U256::from_be_slice(&log.data().data[32..64]);
+                        mirror.update_v2_reserves(pool_addr, r0, r1);
                     }
-                    Err(e) => {
-                        error!("❌ [PILLAR A] Block subscription failed: {:?}. Retrying in 5s...", e);
-                        // The loop will automatically try the next provider in the pool on the next iteration
+                } else {
+                    // V3 Swap Event: [..., sqrtPriceX96, tick, ...]
+                    // V3 logs are more complex, but we extract sqrtPrice from the data/topics
+                    if let Some(state) = the_sovereign_shadow::v3_math::decode_v3_swap_log(&log) {
+                        mirror.update_v3_state(pool_addr, state.sqrt_price, state.tick, state.liquidity);
                     }
                 }
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                // Trigger detector to re-evaluate cycles on state change
+                let _ = f_tx.send(());
             }
         });
     }
-
-    // ── Pillar R: Auditor Maintenance ────────────────────────────────────────
-    // Har 30 minute mein logs check honge aur 2000 lines se zyada hone par purana data delete hoga.
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1800));
-        loop {
-            interval.tick().await;
-            cleanup_auditor_logs();
-            audit_log("SYSTEM", "Maintenance cycle: Logs checked and cleaned if necessary.");
-        }
-    });
 
     tokio::spawn(async move { detector.run().await; });
 
-    // ── Pillar Z: Bootstrap Existing Pools ───────────────────────────────────
-    // Use the strictly loaded address from the top of main()
-    // let aero_factory: Address = env::var("SHADOW_AERO_FACTORY")
-    //     .expect("FATAL: SHADOW_AERO_FACTORY missing from .env. Zenith Protocol initialization failed.")
-    //     .parse()
-    //     .expect("FATAL: Invalid SHADOW_AERO_FACTORY format");
-    
-    let rpc_manager_clone = http_rpc_manager.clone();
-    let pool_tx_clone = pool_tx.clone();
-    let detector_state_clone = detector_state.clone();
-    tokio::spawn(async move {
-        // Pillar Z: Intelligent Priority Bootstrap
-        let mut target_v2_factories = Vec::new();
-        let mut target_aero_factory = Address::zero();
-
-        for ((c, dex), contracts) in constants::DEX_CONTRACTS.iter() {
-            if *c == chain {
-                match dex {
-                    DexName::Aerodrome => target_aero_factory = contracts.factory,
-                    DexName::UniswapV3 | DexName::Maverick | DexName::Permit2 | DexName::CowSwap => {},
-                    _ => {
-                        if !target_v2_factories.contains(&contracts.factory) {
-                            target_v2_factories.push(contracts.factory);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Add manual overrides if provided in .env
-        if let Some(manual) = manual_v2_factory {
-            if !target_v2_factories.contains(&manual) { target_v2_factories.push(manual); }
-        }
-        if let Some(manual) = manual_aero_factory {
-            target_aero_factory = manual;
-        }
-
-        // Priority 1: V3 Derivation (Handled inside detector preload)
-        // We don't need to do anything here, but we ensure it has a head start.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // Priority 2: Aerodrome (High Alpha on Base)
-        if !target_aero_factory.is_zero() {
-            info!("🌊 [ZENITH] Bootstrapping Aerodrome (High Priority)...");
-            if let Err(e) = discovery::sync_initial_pools(rpc_manager_clone.clone(), pool_tx_clone.clone(), Address::zero(), target_aero_factory, bootstrap_count / 2).await { // Distribute total bootstrap count
-                error!("❌ Aerodrome Bootstrap failed: {:?}", e);
-            }
-        }
-
-        // Priority 3: Other V2 Factories (Sushi, BaseSwap, etc.)
-        info!("🌊 [ZENITH] Bootstrapping {} V2 factories...", target_v2_factories.len());
-        let per_factory_limit = (bootstrap_count - (bootstrap_count / 2)) / target_v2_factories.len().max(1); // Remaining count divided among V2 factories
-        for factory_addr in target_v2_factories {
-            // [FIX] Balanced distribution to hit overall bootstrap_count target
-            if let Err(e) = discovery::sync_initial_pools(rpc_manager_clone.clone(), pool_tx_clone.clone(), factory_addr, Address::zero(), per_factory_limit).await {
-                error!("❌ V2 Bootstrap failed for factory {:?}: {:?}", factory_addr, e);
-            }
-        }
-
-        // Pillar C: Build graph ONLY after bootstrap finishes to ensure cycles > 0
-        detector_state_clone.refresh_path_cache();
-    });
-
     info!("🚀 Sovereign Shadow LIVE — hunting alpha at nanosecond speed");
+    if executor_address == Address::ZERO {
+        info!("📋 DRY-RUN: deploy Executor.sol and set EXECUTOR_ADDRESS to go live");
+    }
 
-    // ── Dashboard: real gas every 10s ─────────────────────────────────────────
     {
         let gf = gas_feed.clone();
-        let http_manager = http_rpc_manager.clone(); // Use the manager here
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 interval.tick().await;
                 let (base, priority, _) = gf.current().await;
-                let (b, p): (U256, U256) = if base.is_zero() {
-                    let b_val = http_manager.get_next_provider().get_block(BlockNumber::Latest).await
-                        .ok().flatten()
-                        .and_then(|bl| bl.base_fee_per_gas)
-                        .unwrap_or(U256::from(100_000u64));
-                    let p_val = http_manager.get_next_provider().request::<(), U256>("eth_maxPriorityFeePerGas", ())
-                        .await.unwrap_or(U256::from(100_000u64));
-                    (b_val, p_val)
-                } else { (base, priority) };
-                let bg = b.as_u128() as f64 / 1e9;
-                let pg = p.as_u128() as f64 / 1e9;
-                info!("📊 [GAS] Base: {:.6} gwei | Priority: {:.6} gwei", bg, pg);
+                info!("📊 [GAS] Base: {:.6} gwei | Priority: {:.6} gwei",
+                    base.to::<u128>() as f64 / 1e9,
+                    priority.to::<u128>() as f64 / 1e9);
             }
         });
     }
 
-    // ── Graceful shutdown ─────────────────────────────────────────────────────
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
-    // ── Pillar E: Batch Execution Engine (Optimization) ──
-    let execution_semaphore = Arc::new(tokio::sync::Semaphore::new(batch_size));
+    let exec_sem = Arc::new(tokio::sync::Semaphore::new(1));
     loop {
         tokio::select! {
             Some(opp) = opp_rx.recv() => {
-                // [STRICT TRIGGER] Pillar V: Check both global pause AND watch-only mode
-                if !constants::GLOBAL_PAUSE.load(Ordering::Relaxed) && !constants::WATCH_ONLY_MODE {
-                    if executor_address == Address::zero() {
-                        audit_log("PILLAR E", &format!("DRY-RUN: Opp found for {} wei, but EXECUTOR_ADDRESS is zero.", opp.expected_profit));
-                        debug!("💰 [DRY-RUN] Profit: {} wei", opp.expected_profit);
-                        continue;
-                    }
+                if constants::GLOBAL_PAUSE.load(Ordering::Relaxed) { continue; }
+                let profit_eth = opp.expected_profit.to::<u128>() as f64 / 1e18;
+                if executor_address == Address::ZERO {
+                    info!("💰 [DRY-RUN] Profit: {:.8} ETH | Hops: {}", profit_eth, opp.path.hops.len());
+                    continue;
+                }
+                if let Ok(permit) = exec_sem.clone().try_acquire_owned() {
+                    let exec = flash_executor.clone();
+                    let pm = profit_manager.clone();
+                    let tele = telemetry_handle.clone();
+                    
+                    tele.send(telemetry::TelemetryEvent::OpportunityFound { 
+                        path: format!("{:?}", opp.path.hops), 
+                        est_profit: profit_eth 
+                    });
 
-                    // [10/10 FIX] Acquire permit BEFORE spawning task to ensure strict serial order
-                    if let Ok(permit) = execution_semaphore.clone().try_acquire_owned() {
-                        let exec = flash_executor.clone();
-                        audit_log("PILLAR E", &format!("EXECUTION START: Attempting trade for {} wei profit. (ID: {})", opp.expected_profit, opp.id));
-                        tokio::spawn(async move {
-                            let _ = exec.simulate_and_execute(&opp).await;
-                            drop(permit); // Permit released only after full execution or failure
-                        });
-                    }
+                    tokio::spawn(async move {
+                        match exec.simulate_and_execute(&opp).await {
+                            Ok(hash) => {
+                                info!("✅ [TX] Confirmed: {:?} | {:.8} ETH", hash, profit_eth);
+                                tele.send(telemetry::TelemetryEvent::ExecutionSuccess { 
+                                    tx_hash: format!("{:?}", hash), 
+                                    net_profit: profit_eth 
+                                });
+                                if let Some(d) = opp.profit_details {
+                                    let pm_c = pm.clone();
+                                    tokio::spawn(async move { let _ = pm_c.handle_profit(d.net_profit).await; });
+                                }
+                            }
+                            Err(e) => {
+                                error!("❌ [EXEC] Failed: {}", e);
+                                tele.send(telemetry::TelemetryEvent::ExecutionFailed { error: e.to_string() });
+                            }
+                        }
+                        drop(permit);
+                    });
                 }
             }
             _ = &mut shutdown => {
-                info!("🛑 Shutdown received — closing Sovereign Shadow");
+                info!("🛑 Shutdown — closing Sovereign Shadow");
                 break;
             }
         }
@@ -630,23 +649,111 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Spawns parallel execution for a batch of opportunities.
-fn spawn_batch_execution(batch: Vec<Opportunity>, executor: Arc<FlashLoanExecutor>, pm: Arc<ProfitManager<Provider<Ws>>>) {
-    for opp in batch {
-        let exec = executor.clone();
-        let p_m  = pm.clone();
+async fn run_scout() -> Result<(), Box<dyn Error>> {
+    dotenv().ok();
+    
+    let scout_id = env::var("SCOUT_ID").unwrap_or_else(|_| "global-scout-01".to_string());
+    let wss_raw = env::var("SHADOW_WS_URL")
+        .or_else(|_| env::var("SHADOW_WS_URL_1"))
+        .expect("👁️ Scout needs SHADOW_WS_URL");
+    
+    let wss_urls: Vec<String> = wss_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
+
+    // Default to dynamic port if not specified (Hugging Face default)
+    let sniper_url = env::var("SNIPER_URL").unwrap_or_else(|_| "http://0.0.0.0:7860".to_string());
+    
+    info!("👁️ [SCOUT {}] Initializing Global Eye", scout_id);
+
+    // 1. Setup gRPC Connection to Space B (Sniper)
+    let channel = tonic::transport::Channel::from_shared(sniper_url)?
+        .tcp_nodelay(true) 
+        .connect_lazy();
+    let mut client = hydra::hydra_network_client::HydraNetworkClient::new(channel);
+
+    let (grpc_tx, grpc_rx) = mpsc::channel(4096);
+    let stream = ReceiverStream::new(grpc_rx);
+
+    tokio::spawn(async move {
+        if let Err(e) = client.stream_opportunities(stream).await {
+            error!("❌ [SCOUT] gRPC Stream broken: {}", e);
+        }
+    });
+
+    // 2. Setup Local Mempool Listener
+    let chain_name = env::var("CHAIN").unwrap_or_else(|_| "base".to_string());
+    let chain = match chain_name.as_str() {
+        "base" => the_sovereign_shadow::models::Chain::Base,
+        _ => the_sovereign_shadow::models::Chain::Mainnet,
+    };
+
+    let (mempool_listener, mut mempool_rx, _) = MempoolListener::new(
+        MempoolListenerConfig {
+            endpoints: wss_urls,
+            chain,
+            ..Default::default()
+        },
+        None,
+    ).await?;
+
+    tokio::spawn(async move {
+        if let Err(e) = mempool_listener.run().await {
+            error!("❌ Scout Mempool Listener crashed: {:?}", e);
+        }
+    });
+
+    info!("🚀 [SCOUT {}] Space A ACTIVE - Gossiping binary data to Sniper", scout_id);
+
+    while let Some(event) = mempool_rx.recv().await {
+        let opportunity = RawOpportunity {
+            tx_hash: bytes::Bytes::copy_from_slice(event.tx_hash.as_slice()),
+            pool_address: bytes::Bytes::copy_from_slice(event.swap_info.router.as_slice()),
+            data_payload: event.mempool_tx.map(|m| m.data.0).unwrap_or_default().into(),
+            timestamp: event.received_at.elapsed().as_nanos() as i64,
+            gas_price: event.effective_gas_price.to::<u64>(),
+        };
+
+        let _ = grpc_tx.try_send(opportunity);
+    }
+
+    Ok(())
+}
+
+struct HydraNetworkImpl {
+    tx: mpsc::Sender<RawOpportunity>,
+}
+
+#[tonic::async_trait]
+impl HydraNetwork for HydraNetworkImpl {
+    type StreamOpportunitiesStream = ReceiverStream<Result<Empty, Status>>;
+
+    async fn stream_opportunities(
+        &self,
+        request: Request<Streaming<RawOpportunity>>,
+    ) -> Result<Response<ReceiverStream<Result<Empty, Status>>>, Status> {
+        let mut stream = request.into_inner();
+        let tx = self.tx.clone();
+        
+        // Persistent HTTP/2 stream handler for Global Scouts
         tokio::spawn(async move {
-            match exec.simulate_and_execute(&opp).await {
-                Ok(hash) => {
-                    info!("✅ [TX] Batch Confirmed: {:?}", hash);
-                    if let Some(d) = opp.profit_details {
-                        let _ = p_m.handle_profit(d.net_profit).await;
+            while let Some(opportunity) = stream.next().await {
+                match opportunity {
+                    Ok(opp) => {
+                        if let Err(e) = tx.send(opp).await {
+                            error!("❌ [HYDRA] Internal bridge broken: {}", e);
+                            break;
+                        }
                     }
-                }
-                Err(e) => {
-                    error!("❌ [FATAL] Execution Reverted: {}. Triggering localized safety pause.", e);
+                    Err(e) => {
+                        warn!("⚠️ [HYDRA] Scout connection dropped: {}", e);
+                        break;
+                    }
                 }
             }
         });
+        let (_, rx) = mpsc::channel::<Result<Empty, Status>>(1);
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }

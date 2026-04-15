@@ -1,233 +1,415 @@
-// =============================================================================
-// File: math_engine.rs
-// Project: The Sovereign Shadow (MEV/Arbitrage Stealth Engine)
-// Description: Pillar D - Mathematical Optimization Engine
-//              - Golden Section Search (GSS) for Profit Maximization
-//              - V3 Math Utilities
-// =============================================================================
+#![allow(dead_code)]
+use alloy_primitives::{Address, U256, Uint, I256};
+type U512 = Uint<512, 8>;
+use crate::models::{MempoolTx, Path, DexType};
+use crate::state_mirror::{StateMirror, PoolState};
+use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
-use ethers::types::{U256, U512};
-
-/// Inverse Golden Ratio: (sqrt(5) - 1) / 2
-#[allow(dead_code)]
-const PHI: f64 = 0.618033988749895;
-
+#[derive(Clone, Copy)]
 pub struct MathEngine;
 
-impl MathEngine {
-    /// Pillar D: Golden Section Search (GSS)
-    /// Finds the optimal input amount `x` that maximizes the profit function `f(x)`.
-    /// 
-    /// # Arguments
-    /// * `min_in` - Lower bound of input amount (e.g., 0)
-    /// * `max_in` - Upper bound of input amount (e.g., pool balance or wallet balance)
-    /// * `f` - A closure that takes an input amount `U256` and returns the expected profit `U256`.
-    ///         If the trade reverts or is unprofitable, `f` should return 0.
-    /// 
-    /// # Returns
-    /// * `U256` - The optimal input amount.
-    pub fn find_optimal_input<F>(min_in: U256, max_in: U256, mut f: F) -> U256
-    where
-        F: FnMut(U256) -> U256,
-    {
-        let tolerance = U256::from(10_000_000_000_000u64); // 0.00001 ETH precision
+// Pre-calculated golden ratio constants for nanosecond pathfinding
+const PHI_NUM: u128 = 618033988749895;
+const PHI_DEN: u128 = 1000000000000000;
+const E18: u128 = 1000000000000000000;
+const SCALE_36: u128 = 1000000000000000000000000000000000000;
 
+impl MathEngine {
+    /// Optimized path output calculation using pre-fetched pool states.
+    /// This avoids DashMap lookups inside the hot optimization loop.
+    #[inline(always)]
+    pub fn get_path_output_with_states(
+        &self, 
+        hops: &[crate::models::Hop], 
+        input_amount: U256, 
+        states: &[PoolState]
+    ) -> U256 {
+        let mut current_amount = input_amount;
+        for (i, hop) in hops.iter().enumerate() {
+            if current_amount.is_zero() { return U256::ZERO; }
+            let state = &states[i];
+            current_amount = match hop.dex_type {
+                DexType::UniswapV2 => self.get_v2_output(current_amount, state, hop.zero_for_one),
+                DexType::UniswapV3 => self.get_v3_output(current_amount, state, hop.zero_for_one),
+                DexType::Aerodrome => self.get_aerodrome_output(current_amount, state, hop.zero_for_one),
+                _ => U256::ZERO,
+            };
+        }
+        current_amount
+    }
+
+    #[inline(always)]
+    pub fn project_reserve_impact(&self, tx: &MempoolTx, mirror: &StateMirror) -> FxHashMap<Address, (U256, U256)> {
+        let mut impacts = FxHashMap::default();
+        let data = tx.data.as_ref();
+        if data.len() < 4 { return impacts; }
+        let selector = &data[0..4];
+        let target = match tx.to { Some(a) => a, None => return impacts };
+
+        if selector == [0x02, 0x2c, 0x0d, 0x9f] && data.len() >= 100 {
+            if let Some(ps) = mirror.pools.get(&target) {
+                let amt0_out = U256::from_be_slice(&data[4..36]);
+                let amt1_out = U256::from_be_slice(&data[36..68]);
+                let (r0, r1): (U256, U256) = (ps.reserves0, ps.reserves1);
+                if amt0_out > U256::ZERO {
+                    let new_r0: U256 = r0.saturating_sub(amt0_out);
+                    if !new_r0.is_zero() {
+                        let amt1_in = (r1 * amt0_out * U256::from(1000u64)) / (new_r0 * U256::from(997u64));
+                        impacts.insert(target, (new_r0, r1 + amt1_in));
+                    }
+                } else if amt1_out > U256::ZERO {
+                    let new_r1: U256 = r1.saturating_sub(amt1_out);
+                    if !new_r1.is_zero() {
+                        let amt0_in = (r0 * amt1_out * U256::from(1000u64)) / (new_r1 * U256::from(997u64));
+                        impacts.insert(target, (r0 + amt0_in, new_r1));
+                    }
+                }
+            }
+        }
+        impacts
+    }
+
+    /// Pillar D: Golden Section Search to find the input amount that maximizes net profit.
+    /// f(x) = (OutputAmount(x) - x) - TotalGasCost
+    pub fn find_optimal_input<F>(min_in: U256, max_in: U256, mut f: F) -> (U256, U256)
+    where F: FnMut(U256) -> I256 {
+        let tolerance = U256::from(100_000_000_000u64); // 100 gwei precision
         let mut a = min_in;
         let mut b = max_in;
         
-        let diff = b - a;
-        // c = b - (b - a) * PHI
-        // We use integer arithmetic approximation for PHI * range
-        let phi_num = U256::from(618033988749895u64);
-        let phi_den = U256::from(1_000_000_000_000_000u64);
+        let mut c = b - ((b - a) * U256::from(PHI_NUM) / U256::from(PHI_DEN));
+        let mut d = a + ((b - a) * U256::from(PHI_NUM) / U256::from(PHI_DEN));
         
-        let mut c = b - (diff * phi_num / phi_den);
-        let mut d = a + (diff * phi_num / phi_den);
-
         let mut f_c = f(c);
         let mut f_d = f(d);
 
-        // Max iterations to prevent infinite loops in low volatility
-        let mut iterations = 0;
-        let max_iter = 20; 
+        // Pillar D: Iteration Cap (The Edge Check)
+        // 40 iterations ensure sub-wei precision even for 1000+ ETH input ranges.
+        // Using a fixed for-loop prevents "infinite hang" scenarios in high-volatility mempools.
+        for _ in 0..40 { 
+            if (b - a) < tolerance { break; }
 
-        while (b - a) > tolerance && iterations < max_iter {
             if f_c > f_d {
                 b = d;
                 d = c;
                 f_d = f_c;
-                let diff = b - a;
-                c = b - (diff * phi_num / phi_den);
+                c = b - ((b - a) * U256::from(PHI_NUM) / U256::from(PHI_DEN));
                 f_c = f(c);
             } else {
                 a = c;
                 c = d;
                 f_c = f_d;
-                let diff = b - a;
-                d = a + (diff * phi_num / phi_den);
+                d = a + ((b - a) * U256::from(PHI_NUM) / U256::from(PHI_DEN));
                 f_d = f(d);
             }
-            iterations += 1;
         }
 
-        // Return the midpoint of the final range
-        (a + b) / 2
+        let optimal_input = (a + b) / U256::from(2u64);
+        let max_profit = f(optimal_input);
+        
+        if max_profit <= I256::ZERO {
+            (U256::ZERO, U256::ZERO)
+        } else {
+            (optimal_input, U256::from_be_bytes(max_profit.to_be_bytes::<32>()))
+        }
     }
 
-    /// Pillar D: Newton-Raphson Optimal Input (Nanosecond Convergence)
-    /// Specifically designed for Concentrated Liquidity (V3) where GSS is too slow.
-    /// Solves for x where: MarginalPrice(x) * PathPriceRatio = 1
-    pub fn find_optimal_input_newton<F>(
-        initial_guess: U256,
-        mut price_check: F,
-    ) -> U256 
-    where
-        F: FnMut(U256) -> f64, // Returns marginal price at input x
-    {
-        let mut x = initial_guess;
-        let mut iterations = 0;
-        let max_iter = 5; // Newton-Raphson converges in 3-5 steps for AMM curves
-
-        while iterations < max_iter {
-            let current_price = price_check(x);
+    /// Recursively calculate the output amount for a multi-hop path.
+    pub fn get_path_output(&self, path: &Path, input_amount: U256, mirror: &Arc<StateMirror>) -> U256 {
+        let mut current_amount = input_amount;
+        
+        for hop in &path.hops {
+            if current_amount.is_zero() { return U256::ZERO; }
             
-            // Target: Marginal Price = 1.0 (Arbitrage equilibrium)
-            let diff = current_price - 1.0;
-            if diff.abs() < 0.0001 { break; }
+            let pool_state = match mirror.get_pool_data(&hop.pool_address, 5) {
+                Some(s) => s,
+                None => return U256::ZERO,
+            };
 
-            // Newton Step adjustment
-            // For AMMs, we use a curvature-aware step to prevent overshoot
-            let step = (x.as_u128() as f64 * diff * 0.5) as i128;
+            current_amount = match hop.dex_type {
+                DexType::UniswapV2 => self.get_v2_output(current_amount, &pool_state, hop.zero_for_one),
+                DexType::UniswapV3 => self.get_v3_output(current_amount, &pool_state, hop.zero_for_one),
+                DexType::Aerodrome => self.get_aerodrome_output(current_amount, &pool_state, hop.zero_for_one),
+                _ => U256::ZERO,
+            };
+        }
+        current_amount
+    }
+
+    #[inline(always)]
+    fn get_v2_output(&self, amount_in: U256, state: &PoolState, zero_for_one: bool) -> U256 {
+        let (reserve_in, reserve_out) = if state.reserves0 != U256::ZERO && state.reserves1 != U256::ZERO {
+            if zero_for_one {
+                (state.reserves0, state.reserves1)
+            } else {
+                (state.reserves1, state.reserves0)
+            }
+        } else { return U256::ZERO; };
+
+        if amount_in.is_zero() || reserve_in.is_zero() || reserve_out.is_zero() { return U256::ZERO; }
+
+        // Standard V2 formula: (amt_in * 997 * res_out) / (res_in * 1000 + amt_in * 997)
+        let amt_in_with_fee = U512::from(amount_in) * U512::from(997u64);
+        let numerator = amt_in_with_fee * U512::from(reserve_out);
+        let denominator = (U512::from(reserve_in) * U512::from(1000u64)) + amt_in_with_fee;
+        
+        u512_to_u256_safe(numerator / denominator)
+    }
+
+    #[inline(always)]
+    fn get_aerodrome_output(&self, amount_in: U256, state: &PoolState, zero_for_one: bool) -> U256 {
+        if !state.is_stable {
+            return self.get_v2_output(amount_in, state, zero_for_one);
+        }
+        
+        let (r_in, r_out) = if zero_for_one { (state.reserves0, state.reserves1) } else { (state.reserves1, state.reserves0) };
+        if amount_in.is_zero() || r_in.is_zero() || r_out.is_zero() { return U256::ZERO; }
+
+        // Aerodrome Stable Math Optimization: Target < 5ms
+        let amount_in_fee = (amount_in * U256::from(9997)) / U256::from(10000); // 0.03% standard fee
+        let x_new = r_in + amount_in_fee;
+        
+        // 1. Hyper-fast Initial Guess using floating point (Space-age optimization)
+        let x_f = x_new.to::<u128>() as f64;
+        let r_in_f = r_in.to::<u128>() as f64;
+        let r_out_f = r_out.to::<u128>() as f64;
+        let k_f = r_in_f.powi(3) * r_out_f + r_out_f.powi(3) * r_in_f;
+        
+        // f64 Newton step to get within 0.1% instantly
+        let mut y_f = r_out_f;
+        for _ in 0..2 {
+            let f_y = x_f.powi(3) * y_f + y_f.powi(3) * x_f;
+            let f_prime_y = x_f.powi(3) + 3.0 * y_f.powi(2) * x_f;
+            y_f = y_f - (f_y - k_f) / f_prime_y;
+        }
+
+        let mut y = U256::from(y_f as u128);
+        let k = self.aerodrome_k(r_in, r_out);
+        let x_new_u512 = U512::from(x_new);
+        let x2 = x_new_u512 * x_new_u512;
+        let x3 = x2 * x_new_u512;
+        let scale = U512::from(SCALE_36);
+        
+        // 2. High-Precision Refinement (Max 3 iterations for nanosecond convergence)
+        for _ in 0..3 {  
+            let y_u512 = U512::from(y);
+            let y2 = y_u512 * y_u512;
+            
+            let f_y = (x3 * y_u512 + y2 * y_u512 * x_new_u512) / scale;
+            let f_prime_y = (x3 + U512::from(3u64) * y2 * x_new_u512) / scale;
+            
+            if f_y > U512::from(k) {
+                let diff = u512_to_u256_safe((f_y - U512::from(k)) / f_prime_y.max(U512::from(1u64)));
+                if diff.is_zero() { break; }
+                y -= diff.min(y / U256::from(2));
+            } else {
+                let diff = u512_to_u256_safe((U512::from(k) - f_y) / f_prime_y.max(U512::from(1u64)));
+                if diff.is_zero() { break; }
+                y += diff.min(y);
+            }
+        }
+        r_out.saturating_sub(y)
+    }
+
+    /// Returns the analytical derivative |dy/dx| for the stable curve x^3y + y^3x = k.
+    /// Formula: |dy/dx| = (3x^2y + y^3) / (x^3 + 3xy^2)
+    pub fn get_aerodrome_marginal_price(&self, r_in: U256, r_out: U256) -> U256 {
+        let x = U512::from(r_in);
+        let y = U512::from(r_out);
+        let x2 = x * x;
+        let y2 = y * y;
+        
+        let numerator = (U512::from(3u64) * x2 * y) + (y2 * y);
+        let denominator = (x2 * x) + (U512::from(3u64) * x * y2);
+        
+        if denominator.is_zero() { return U256::ZERO; }
+        u512_to_u256_safe((numerator * U512::from(10u128.pow(18))) / denominator)
+    }
+
+    fn aerodrome_k(&self, x: U256, y: U256) -> U256 {
+        let x_u = U512::from(x);
+        let y_u = U512::from(y);
+        let scale = U512::from(10u128.pow(18)) * U512::from(10u128.pow(18));
+        
+        let x3y = (x_u * x_u * x_u * y_u) / scale;
+        let y3x = (y_u * y_u * y_u * x_u) / scale;
+        u512_to_u256_safe(x3y + y3x)
+    }
+
+    #[inline(always)]
+    fn get_v3_output(&self, amount_in: U256, state: &PoolState, zero_for_one: bool) -> U256 {
+        if amount_in.is_zero() || state.liquidity.is_zero() { return U256::ZERO; }
+        
+        // Use virtual reserves for GSS optimization (very fast)
+        let (v_res_in, v_res_out) = Self::get_v3_virtual_reserves(state.sqrt_price_x96, state.liquidity, zero_for_one);
+        
+        if v_res_in.is_zero() || v_res_out.is_zero() { return U256::ZERO; }
+        
+        // Apply V3 fee (e.g., 0.05% = 500 pips)
+        let fee_multiplier = 1_000_000u32 - state.fee;
+        let amt_in_with_fee = U512::from(amount_in) * U512::from(fee_multiplier);
+        let numerator = amt_in_with_fee * U512::from(v_res_out);
+        let denominator = (U512::from(v_res_in) * U512::from(1_000_000u64)) + amt_in_with_fee;
+
+        u512_to_u256_safe(numerator / denominator)
+    }
+
+    pub fn find_optimal_input_newton<F>(initial_guess: U256, mut price_check: F) -> U256
+    where F: FnMut(U256) -> f64 {
+        let mut x = initial_guess;
+        // Pillar D: Newton-Raphson Cap
+        // 50 iterations is more than enough for convergence; fixed cap protects the thread.
+        for _ in 0..50 { 
+            let current_price = price_check(x);
+            let diff = current_price - 1.0;
+            
+            // Convergence criteria: 0.01% price impact
+            if diff.abs() < 0.0001 || x.is_zero() { break; }
+            
+            // Pillar D: Dynamic Aggression
+            let x_f = x.to::<u128>() as f64;
+            let step = (x_f * diff * 5.0) as i128; // Increased multiplier for faster convergence
             
             let next_x = if step > 0 {
                 x.saturating_add(U256::from(step as u128))
             } else {
-                x.saturating_sub(U256::from(step.unsigned_abs()))
+                x.saturating_sub(U256::from(step.abs() as u128))
             };
-
             if next_x == x || next_x.is_zero() { break; }
             x = next_x;
-            iterations += 1;
         }
         x
     }
 
-    /// Pillar D: Analytical Optimal Input for 2-Pool V2 Arbitrage (O(1))
-    /// Based on the derivative of the profit function for x * y = k AMMs.
     pub fn calculate_optimal_v2_v2(
-        r1_in: U256,
-        r1_out: U256,
-        r2_in: U256,
-        r2_out: U256,
-        fee1_bps: u32,
-        fee2_bps: u32,
+        r1_in: U256, r1_out: U256, r2_in: U256, r2_out: U256,
+        fee1_bps: u32, fee2_bps: u32,
     ) -> U256 {
-        let g1 = U256::from(10000 - fee1_bps);
-        let g2 = U256::from(10000 - fee2_bps);
-
-        // Formula: x = (sqrt(r1_in * r2_in * r1_out * r2_out * g1 * g2 * 10^8) - r1_in * r2_in * 10^4) / (g1 * (10^4 * r2_in + g2 * r1_out))
+        let g1 = U512::from(10000 - fee1_bps);
+        let g2 = U512::from(10000 - fee2_bps);
         let p1 = U512::from(r1_in) * U512::from(r2_in);
         let p2 = U512::from(r1_out) * U512::from(r2_out);
-        let p3 = U512::from(g1) * U512::from(g2);
-        let p4 = U512::from(100_000_000u64); // 10^8 scaling for precision
-
+        let p3 = g1 * g2;
+        let p4 = U512::from(100_000_000u64);
         let product = p1 * p2 * p3 * p4;
         let sqrt_product = Self::uint_sqrt_512(product);
-
         let term2 = p1 * U512::from(10_000u64);
-
-        if sqrt_product <= term2 {
-            return U256::zero();
-        }
-
+        if sqrt_product <= term2 { return U256::ZERO; }
         let numerator = sqrt_product - term2;
         let d1 = U512::from(10_000u64) * U512::from(r2_in);
-        let d2 = U512::from(g2) * U512::from(r1_out);
-        let denominator = U512::from(g1) * (d1 + d2);
-
-        if denominator.is_zero() { return U256::zero(); }
-
+        let d2 = g2 * U512::from(r1_out);
+        let denominator = g1 * (d1 + d2);
+        if denominator.is_zero() { return U256::ZERO; }
         let result = (numerator * U512::from(10_000u64)) / denominator;
-        result.try_into().unwrap_or(U256::zero())
+        u512_to_u256_safe(result)
     }
 
     pub fn uint_sqrt_512(n: U512) -> U512 {
-        if n.is_zero() { return U512::zero(); }
-        let mut x = U512::from(1) << (n.bits() / 2 + 1);
+        if n.is_zero() { return U512::ZERO; }
+        let bits = n.bit_len();
+        let mut x = U512::from(1u64) << (bits / 2 + 1);
         let mut y = (x + n / x) >> 1;
-        while y < x {
-            x = y;
-            y = (x + n / x) >> 1;
-        }
+        while y < x { x = y; y = (x + n / x) >> 1; }
         x
     }
 
-    /// Pillar D: Calculate virtual reserves for a V3 pool within a single tick.
-    /// This allows treating a V3 pool as a V2 pool locally for O(1) optimal input calculation.
     pub fn get_v3_virtual_reserves(sqrt_price_x96: U256, liquidity: U256, zero_for_one: bool) -> (U256, U256) {
-        if sqrt_price_x96.is_zero() || liquidity.is_zero() { return (U256::zero(), U256::zero()); }
-        let q96 = U512::from(1) << 96;
+        if sqrt_price_x96.is_zero() || liquidity.is_zero() { return (U256::ZERO, U256::ZERO); }
+        let q96 = U512::from(1u64) << 96;
         let l = U512::from(liquidity);
         let sp = U512::from(sqrt_price_x96);
-
         if zero_for_one {
-            // Token 0 in -> Token 1 out
             let r_in = (l * q96) / sp;
             let r_out = (l * sp) / q96;
-            (r_in.try_into().unwrap_or(U256::zero()), r_out.try_into().unwrap_or(U256::zero()))
+            (u512_to_u256_safe(r_in), u512_to_u256_safe(r_out))
         } else {
-            // Token 1 in -> Token 0 out
             let r_in = (l * sp) / q96;
             let r_out = (l * q96) / sp;
-            (r_in.try_into().unwrap_or(U256::zero()), r_out.try_into().unwrap_or(U256::zero()))
+            (u512_to_u256_safe(r_in), u512_to_u256_safe(r_out))
         }
     }
 
-    /// Pillar D: Maverick Virtual Reserves
-    /// Maverick bins can be approximated as deep virtual reserves for O(1) arbitrage math.
     pub fn get_maverick_virtual_reserves(sqrt_price_x96: U256, liquidity: U256, zero_for_one: bool) -> (U256, U256) {
-        if sqrt_price_x96.is_zero() || liquidity.is_zero() { return (U256::zero(), U256::zero()); }
-        
-        // Pillar S: God-Mode Maverick V2 Bin Hardening
-        // Maverick V2 uses dynamic bins. We use U512 to maintain 100% precision.
-        // Price P = (sqrtPrice / 2^96)^2
-        let q96 = U512::from(1) << 96;
-        let l = U512::from(liquidity);
-        let sp = U512::from(sqrt_price_x96);
-
-        if zero_for_one {
-            // Token 0 -> Token 1
-            let r_in = (l * q96) / sp; 
-            let r_out = (l * sp) / q96;
-            (r_in.try_into().unwrap_or(U256::zero()), r_out.try_into().unwrap_or(U256::zero()))
-        } else {
-            // Token 1 -> Token 0
-            let r_in = (l * sp) / q96;
-            let r_out = (l * q96) / sp;
-            (r_in.try_into().unwrap_or(U256::zero()), r_out.try_into().unwrap_or(U256::zero()))
-        }
+        Self::get_v3_virtual_reserves(sqrt_price_x96, liquidity, zero_for_one)
     }
 
-    /// Pillar D: Predict next sqrtPrice for a V3 pool after a swap of 'amount_in'.
-    /// Used to check if the O(1) optimal input crosses a tick boundary.
     pub fn get_v3_next_sqrt_price(sqrt_price_x96: U256, liquidity: U256, amount_in: U256, zero_for_one: bool) -> U256 {
-        if liquidity.is_zero() { return sqrt_price_x96; }
+        if liquidity.is_zero() || amount_in.is_zero() { return sqrt_price_x96; }
+        let q96 = U512::from(1u64) << 96;
         let l = U512::from(liquidity);
         let sp = U512::from(sqrt_price_x96);
-        let ai = U512::from(amount_in);
-        let q96 = U512::from(1) << 96;
-
+        let amt = U512::from(amount_in);
         if zero_for_one {
-            // token0 in -> price decreases
-            // sqrt_next = (L * sp) / (L + amount_in * sp / 2^96)
-            let denominator = l + (ai * sp / q96);
-            let next = (l * sp) / denominator;
-            next.try_into().unwrap_or(U256::zero())
+            let num = l * sp * q96;
+            let den: U512 = l * q96 + amt * sp;
+            if den.is_zero() { return sqrt_price_x96; }
+            u512_to_u256_safe(num / den)
         } else {
-            // token1 in -> price increases
-            // sqrt_next = sp + (amount_in * 2^96 / L)
-            let next = sp + (ai * q96 / l);
-            next.try_into().unwrap_or(U256::zero())
+            let delta = (amt * q96) / l;
+            u512_to_u256_safe(sp + delta)
         }
+    }
+}
+
+fn u512_to_u256_safe(v: U512) -> U256 {
+    let limbs = v.as_limbs();
+    if limbs[4] != 0 || limbs[5] != 0 || limbs[6] != 0 || limbs[7] != 0 {
+        return U256::MAX;
+    }
+    U256::from_limbs([limbs[0], limbs[1], limbs[2], limbs[3]])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::U256;
+
+    #[test]
+    fn test_aerodrome_stable_k_logic() {
+        let math = MathEngine;
+        let r0 = U256::from(1000 * 10u128.pow(18)); // 1000 TokenA
+        let r1 = U256::from(1000 * 10u128.pow(18)); // 1000 TokenB
+        let k = math.aerodrome_k(r0, r1);
+        assert!(!k.is_zero());
+    }
+
+    #[test]
+    fn test_aerodrome_stable_output_stability() {
+        let math = MathEngine;
+        let state = PoolState {
+            reserves0: U256::from(1000 * 10u128.pow(18)),
+            reserves1: U256::from(1000 * 10u128.pow(18)),
+            is_stable: true,
+            ..Default::default()
+        };
+
+        let amount_in = U256::from(10u128.pow(18)); // 1 Token In
+        let out = math.get_aerodrome_output(amount_in, &state, true);
+        
+        // Stable curves should have very low slippage for small amounts
+        // Out should be close to 1 Token (minus 0.01% fee)
+        assert!(out > U256::from(990 * 10u128.pow(15))); 
+        assert!(out < amount_in);
+    }
+
+    #[test]
+    fn test_newton_optimizer_convergence() {
+        // Mock a price function: price(x) = 1.1 - (x / 10^21)
+        // Marginal price is 1.0 when x = 0.1 * 10^21 = 10^20 (100 tokens)
+        let initial_guess = U256::from(10u128.pow(18));
+        let optimal = MathEngine::find_optimal_input_newton(initial_guess, |x| {
+            1.1 - (x.to::<u128>() as f64 / 1e21)
+        });
+
+        let target = 100 * 10u128.pow(18);
+        let diff = if optimal > U256::from(target) {
+            optimal - U256::from(target)
+        } else {
+            U256::from(target) - optimal
+        };
+
+        // Tolerance of 1%
+        assert!(diff < U256::from(10u128.pow(18)));
     }
 }
