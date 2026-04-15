@@ -1,5 +1,5 @@
 # --- STAGE 1: BUILD ENGINE ---
-FROM rust:1.77-slim-bookworm AS builder
+FROM rust:1.82-slim-bookworm AS builder
 
 # Install build-essential tools for high-performance crates (secp2k1, alloy)
 RUN apt-get update && apt-get install -y \
@@ -14,13 +14,9 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /usr/src/app
 COPY . .
 
-# Pillar HF Optimization: Limit parallel jobs to prevent OOM (Out of Memory)
-# We also ensure protoc can find the proto files
-ENV PROTOC=/usr/bin/protoc
-ENV PROTOC_NO_VENDOR=1
-RUN CARGO_NET_GIT_FETCH_WITH_CLI=true \
-    cargo build --release --jobs 1
-
+# Build with high-level optimization (Release Mode)
+# Cargo.toml already has strip = true and lto = "fat" for nanosecond edge.
+RUN cargo build --release
 
 # --- STAGE 2: THE FORTRESS RUNTIME ---
 FROM debian:bookworm-slim
@@ -38,7 +34,7 @@ COPY --from=builder /usr/src/app/target/release/the-sovereign-shadow /app/
 ENV PORT=7860
 EXPOSE 7860
 
-# Pillar MODE: Support for Double Space architecture (Space A: scout / Space B: sniper)
+# Pillar MODE: Support for Double Space architecture
 ENV MODE=sniper
 
 CMD ["sh", "-c", "./the-sovereign-shadow ${MODE}"]
