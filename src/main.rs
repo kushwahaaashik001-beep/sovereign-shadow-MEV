@@ -308,13 +308,32 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
         l1_calc.clone(), // Fix: Pass all 8 arguments to constructor
     ));
 
-    // Pillar Z: Warm Start Discovery
-    // Bug Fix: Must run warm_start before hunting to populate the pool graph
-    {
-        let discovery = Discovery::new(ws_provider.clone(), pool_tx.clone(), chain);
-        info!("🔍 [PILLAR Z] Initializing Warm Start (Scanning historical liquidity)...");
-        discovery.warm_start().await;
-    }
+    // Nerve Bridge C: Pre-initialize Detector to catch Bootstrap events
+    let (priority_tx_dummy, priority_rx_dummy) = mpsc::channel::<the_sovereign_shadow::mempool_listener::SwapEvent>(256);
+    drop(priority_tx_dummy);
+
+    let (swap_tx, swap_rx) = mpsc::channel(4096);
+    
+    let mut detector_config = DetectorConfig::default();
+    detector_config.chain = chain;
+    detector_config.executor_address = executor_address;
+    detector_config.bribe_percent = 60;
+    detector_config.scanner_threads = 16;
+    detector_config.min_profit_wei = U256::from(10u64.pow(13));
+
+    let (detector, mut opp_rx, force_tx) = ArbitrageDetector::new(
+        detector_config,
+        ws_provider.clone(),
+        state_mirror.clone(),
+        gas_feed.clone(),
+        bidding_engine.clone(),
+        swap_rx,
+        priority_rx_dummy,
+        pool_tx.subscribe(),
+    ).await;
+
+    // Nerve Bridge C: Start the Brain immediately so it catches the Bootstrap events
+    tokio::spawn(async move { detector.run().await; });
 
     // Pillar Q: Bootstrap Protocol (Minimal RPC calls)
     info!("🛠️ [PILLAR Q] Executing Bootstrap Protocol...");
@@ -396,8 +415,6 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    let (swap_tx, swap_rx) = mpsc::channel(4096);
-
     // Global Deduplication Cache & Shared Decoder
     let decoder = Arc::new(the_sovereign_shadow::universal_decoder::UniversalDecoder::new());
     let seen_hashes = Arc::new(DashSet::with_capacity_and_hasher(50_000, std::hash::BuildHasherDefault::<rustc_hash::FxHasher>::default()));
@@ -476,13 +493,6 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
 
     the_sovereign_shadow::p2p_engine::start_p2p_bridge(p2p_alloy_tx);
 
-    let mut detector_config = DetectorConfig::default();
-    detector_config.chain = chain;
-    detector_config.executor_address = executor_address;
-    detector_config.bribe_percent = 60;
-    detector_config.scanner_threads = 16;
-    detector_config.min_profit_wei = U256::from(10u64.pow(13));
-
     let mut pool_rx = pool_tx.subscribe();
 
     // Pillar Z: Proactive Pool Initialization Task
@@ -490,10 +500,22 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     let provider_init = ws_provider.clone();
     tokio::spawn(async move {
         while let Ok(event) = pool_rx.recv().await {
-            let pool_addr = match event {
-                NewPoolEvent::V2(ref d) => d.pair,
-                NewPoolEvent::V3(ref d) => d.pool,
+                let (pool_addr, dex_type) = match event {
+                    NewPoolEvent::V2(ref d) => {
+                        let dt = match d.dex_name {
+                            the_sovereign_shadow::models::DexName::Aerodrome => the_sovereign_shadow::models::DexType::Aerodrome,
+                            _ => the_sovereign_shadow::models::DexType::UniswapV2,
+                        };
+                        (d.pair, dt)
+                    }
+                    NewPoolEvent::V3(ref d) => (d.pool, the_sovereign_shadow::models::DexType::UniswapV3),
             };
+
+                // Seed state mirror so background sync can pick it up
+                mirror_init.pools.entry(pool_addr).or_insert(the_sovereign_shadow::state_mirror::PoolState {
+                    dex_type,
+                    ..Default::default()
+                });
 
             // Pillar L: Proactive Bytecode Warming for X-Ray Scanning
             let m = mirror_init.clone();
@@ -502,7 +524,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
                 m.fetch_and_cache_bytecode(pool_addr, p).await;
             });
 
-            if let NewPoolEvent::V2(data) = event {
+                if let NewPoolEvent::V2(ref data) = event {
                 if data.dex_name == the_sovereign_shadow::models::DexName::Aerodrome {
                     let mirror = mirror_init.clone();
                     mirror.update_aerodrome_stable(data.pair, true);
@@ -511,20 +533,14 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    let pool_rx_for_detector = pool_tx.subscribe();
-    let (priority_tx_dummy, priority_rx_dummy) = mpsc::channel::<the_sovereign_shadow::mempool_listener::SwapEvent>(256);
-    drop(priority_tx_dummy);
-
-    let (detector, mut opp_rx, force_tx) = ArbitrageDetector::new(
-        detector_config,
-        ws_provider.clone(),
-        state_mirror.clone(),
-        gas_feed.clone(),
-        bidding_engine.clone(),
-        swap_rx,
-        priority_rx_dummy,
-        pool_rx_for_detector,
-    ).await;
+    // Pillar Z: Warm Start Discovery
+    // Bug Fix: Must run warm_start before hunting to populate the pool graph
+    {
+        let discovery = Discovery::new(ws_provider.clone(), pool_tx.clone(), chain);
+        info!("🔍 [PILLAR Z] Initializing Warm Start (Scanning historical liquidity)...");
+        discovery.bootstrap_core_pools(); // Seeding happens while listeners are active
+        discovery.warm_start().await;
+    }
 
     // Pillar S: Real-time State Mirror Syncing (The Lifeblood)
     {
@@ -564,8 +580,6 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
             }
         });
     }
-
-    tokio::spawn(async move { detector.run().await; });
 
     info!("🚀 Sovereign Shadow LIVE — hunting alpha at nanosecond speed");
     if executor_address == Address::ZERO {

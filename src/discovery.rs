@@ -2,23 +2,56 @@ use alloy::providers::{RootProvider, Provider};
 use alloy::transports::BoxTransport;
 use alloy_primitives::Address;
 use alloy::rpc::types::Filter;
-use alloy_primitives::fixed_bytes;
+use alloy_primitives::B256;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{info, warn, error};
 use crate::factory_scanner::{NewPoolEvent, V2PoolData, V3PoolData};
 use crate::models::{Chain, DexName};
+use crate::constants;
 
 /// Pillar Z: Historical pool discovery via log scanning (Warm Start).
 pub struct Discovery {
     provider: Arc<RootProvider<BoxTransport>>,
     pool_tx: broadcast::Sender<NewPoolEvent>,
-    _chain: Chain,
+    chain: Chain,
 }
 
 impl Discovery {
     pub fn new(provider: Arc<RootProvider<BoxTransport>>, pool_tx: broadcast::Sender<NewPoolEvent>, chain: Chain) -> Self {
-        Self { provider, pool_tx, _chain: chain }
+        Self { provider, pool_tx, chain }
+    }
+
+    /// Pillar Z: Pre-seed registry with core liquid pairs to ensure immediate readiness.
+    pub fn bootstrap_core_pools(&self) {
+        info!("🧬 [PILLAR Z] Force-feeding Registry with CORE liquidity clusters...");
+        
+        if self.chain == Chain::Base {
+            let core_pools = vec![
+                // Primary Liquidity Hubs (WETH-USDC)
+                NewPoolEvent::V3(V3PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_USDC, fee: 500, pool: constants::POOL_UNIV3_WETH_USDC_005, dex_name: DexName::UniswapV3 }),
+                NewPoolEvent::V3(V3PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_USDC, fee: 3000, pool: constants::POOL_UNIV3_WETH_USDC_030, dex_name: DexName::UniswapV3 }),
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_USDC, pair: constants::POOL_BASESWAP_WETH_USDC, dex_name: DexName::BaseSwap }),
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_USDC, pair: constants::POOL_AERO_WETH_USDC, dex_name: DexName::Aerodrome }),
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_USDC, pair: constants::POOL_SUSHI_WETH_USDC, dex_name: DexName::SushiSwap }),
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_USDC, pair: constants::POOL_PANCAKESWAP_WETH_USDC, dex_name: DexName::PancakeSwap }),
+
+                // Secondary alpha clusters (WETH-AERO, WETH-DEGEN)
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_AERO, pair: constants::POOL_AERO_WETH_AERO, dex_name: DexName::Aerodrome }),
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_DEGEN, pair: constants::POOL_UNIV2_WETH_DEGEN, dex_name: DexName::UniswapV2 }),
+                
+                // Cross-alpha edges (USDC-DEGEN)
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_USDC, token_1: constants::TOKEN_DEGEN, pair: constants::POOL_UNIV2_USDC_DEGEN, dex_name: DexName::UniswapV2 }),
+            ];
+
+            let mut count = 0;
+            for pool_event in core_pools {
+                if self.pool_tx.send(pool_event).is_ok() {
+                    count += 1;
+                }
+            }
+            info!("✅ [PILLAR Z] Force-fed {} core clusters to Base registry. Graph is now primed.", count);
+        }
     }
 
     pub async fn warm_start(&self) {
@@ -33,8 +66,8 @@ impl Discovery {
             // Further reduced range to 500 blocks for free-tier RPC stability
             let start_block = current_block.saturating_sub(500); // Keep this small to avoid RPC limits
 
-            let v2_topic = fixed_bytes!("0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cd33e8bb5511a35a1d");
-            let v3_topic = fixed_bytes!("783cca1c0412dd0d695e784d03c4399881a4e8a1f8e136325997d9cf1673e728");
+            let v2_topic = B256::from(constants::EVENT_V2_PAIR_CREATED);
+            let v3_topic = B256::from(constants::EVENT_V3_POOL_CREATED);
 
             let mut current_start = start_block;
             let step = 500; // Smaller chunks to prevent timeouts and RPC rejections
@@ -51,9 +84,10 @@ impl Discovery {
                         let mut count = 0;
                         for log in logs {
                             let data = log.data().data.as_ref();
-                            if !log.topics().is_empty() && log.topics()[0] == v2_topic && log.topics().len() >= 3 {
-                                let token0 = Address::from_word(log.topics()[1]);
-                                let token1 = Address::from_word(log.topics()[2]);
+                            let topics = log.topics();
+                            if !topics.is_empty() && topics[0] == v2_topic && topics.len() >= 3 {
+                                let token0 = Address::from_word(topics[1]);
+                                let token1 = Address::from_word(topics[2]);
                                 if data.len() >= 32 {
                                     let pair = Address::from_slice(&data[12..32]);
                                     let _ = pool_tx.send(NewPoolEvent::V2(V2PoolData { 
@@ -61,12 +95,12 @@ impl Discovery {
                                     }));
                                     count += 1;
                                 }
-                            } else if !log.topics().is_empty() && log.topics()[0] == v3_topic && log.topics().len() >= 4 {
-                                let token0 = Address::from_word(log.topics()[1]);
-                                let token1 = Address::from_word(log.topics()[2]);
+                            } else if !topics.is_empty() && topics[0] == v3_topic && topics.len() >= 4 {
+                                let token0 = Address::from_word(topics[1]);
+                                let token1 = Address::from_word(topics[2]);
                                 if data.len() >= 64 {
                                     // Fee is indexed in topics[3], not in data
-                                    let fee = u32::from_be_bytes([0, log.topics()[3][29], log.topics()[3][30], log.topics()[3][31]]);
+                                    let fee = u32::from_be_bytes([0, topics[3][29], topics[3][30], topics[3][31]]);
                                     let pool = Address::from_slice(&data[44..64]);
                                     let _ = pool_tx.send(NewPoolEvent::V3(V3PoolData { 
                                         token_0: token0, token_1: token1, fee, pool, dex_name: DexName::UniswapV3 
@@ -78,11 +112,12 @@ impl Discovery {
                         if count > 0 { info!("✅ [PILLAR Z] Injected {} pools from historical blocks.", count); }
                     }
                     Err(e) => {
-                        error!("❌ [PILLAR Z] Warm Start chunk scan failed: {}", e);
-                        if e.to_string().contains("-32002") || e.to_string().contains("Archive") || e.to_string().contains("limit") {
-                            warn!("⚠️ [PILLAR Z] Historical scan restricted. Continuing with real-time discovery only.");
+                        let err_msg = e.to_string();
+                        if err_msg.contains("-32002") || err_msg.contains("Archive") || err_msg.contains("limit") {
+                            warn!("⚠️ [PILLAR Z] Historical scan restricted by RPC plan (Chainstack/Alchemy). Discovery will rely on bootstrap pools and real-time logs.");
                             break;
                         }
+                        error!("❌ [PILLAR Z] Warm Start chunk scan failed: {}", err_msg);
                     }
                 }
                 current_start = current_end + 1;
