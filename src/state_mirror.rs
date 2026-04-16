@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::models::DexType;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-pub const MULTICALL_BATCH_SIZE: usize = 200; // Increased for Base Multicall3 efficiency
+pub const MULTICALL_BATCH_SIZE: usize = 200;
 
 sol! {
     #[sol(rpc)]
@@ -105,7 +105,7 @@ pub struct StateMirror {
     pub current_block: Arc<AtomicU64>,
     pub last_block_timestamp: Arc<AtomicU64>,
     pub last_multicall_sync: Arc<AtomicU64>,
-    pub storage_cache: Arc<DashMap<(Address, U256), U256, BuildHasherDefault<FxHasher>>>, // Added storage tracking
+    pub storage_cache: Arc<DashMap<(Address, U256), U256, BuildHasherDefault<FxHasher>>>,
     pub sync_filter: Arc<ArcSwap<FxHashSet<Address>>>,
     pub p2p_priority_feed: Arc<AtomicBool>,
     pub poisoned_accounts: Arc<DashMap<Address, bool, BuildHasherDefault<FxHasher>>>,
@@ -133,14 +133,12 @@ impl StateMirror {
     pub async fn sync_block(&self, block_number: u64, base_fee: U256, timestamp: u64) {
         let prev = self.current_block.load(Ordering::Acquire);
         if prev != 0 && block_number > prev + 1 {
-            tracing::warn!("⚠️ [STATE] Gap detected: Missed {} blocks. Forcing resync.", block_number - prev - 1);
+            tracing::warn!("[STATE] Gap detected: Missed {} blocks. Forcing resync.", block_number - prev - 1);
             self.mark_dirty();
         }
-        
         self.current_block.store(block_number, Ordering::Release);
         self.last_block_timestamp.store(timestamp, Ordering::Release);
-        
-        let next_base_fee = (base_fee * U256::from(1125u64)) / U256::from(1000u64); // Standard EIP-1559 12.5% increase
+        let next_base_fee = (base_fee * U256::from(1125u64)) / U256::from(1000u64);
         let current = self.gas_state.load();
         let mut new_gas = (**current).clone();
         new_gas.base_fee = base_fee;
@@ -156,7 +154,7 @@ impl StateMirror {
         let limit = crate::constants::MAX_NODE_LAG_SECONDS;
         if drift > limit {
             return Err(crate::models::MEVError::Other(format!(
-                "🛡️ [PILLAR T] Block Lag: {}s > {}s limit", drift, limit
+                "[PILLAR T] Block Lag: {}s > {}s limit", drift, limit
             )));
         }
         Ok(())
@@ -169,9 +167,7 @@ impl StateMirror {
             DashSet::with_hasher(BuildHasherDefault::default())
         });
         entry.insert(trader);
-        
-        // Memory Management: Keep registry lean
-        if entry.len() > 100 { entry.clear(); } 
+        if entry.len() > 100 { entry.clear(); }
     }
 
     pub fn update_sync_filter(&self, filter: FxHashSet<Address>) {
@@ -184,69 +180,55 @@ impl StateMirror {
 
     /// Pillar B/H: Fetch bytecode from RPC and scan for malicious patterns.
     pub async fn fetch_and_cache_bytecode<P: Provider<BoxTransport>>(&self, address: Address, provider: Arc<P>) {
-        // Skip if address is a known safe token (WETH, USDC etc)
-        if crate::constants::CORE_TOKENS.contains(&address) {
-            return;
-        }
-
-        if self.bytecodes.contains_key(&address) || self.is_poisoned(&address) {
-            return;
-        }
+        if crate::constants::CORE_TOKENS.contains(&address) { return; }
+        if self.bytecodes.contains_key(&address) || self.is_poisoned(&address) { return; }
 
         match provider.get_code_at(address).await {
             Ok(code) => {
                 if code.is_empty() { return; }
-                
-                // Pillar H: Static Analysis for Honeypot Opcodes
                 if self.is_malicious_bytecode(&code) {
-                    tracing::warn!("🛡️ [PILLAR H] Malicious pattern detected at {:?}", address);
+                    tracing::warn!("[PILLAR H] Malicious pattern detected at {:?}", address);
                     self.poisoned_accounts.insert(address, true);
                     return;
                 }
-
                 let revm_code = Bytecode::new_raw(rBytes::from(code.to_vec()));
                 self.bytecodes.insert(address, revm_code);
             }
-            Err(e) => tracing::error!("❌ [State Mirror] Bytecode fetch error: {}", e),
+            Err(e) => tracing::error!("[State Mirror] Bytecode fetch error: {}", e),
         }
     }
 
+    /// Pillar H/X/L: Honeypot detection via bytecode analysis.
+    /// FIX: Large contracts (>8KB) are whitelisted — DEX pools use SELFDESTRUCT in proxy patterns.
     fn is_malicious_bytecode(&self, code: &Bytes) -> bool {
         let code_ref = code.as_ref();
+        let code_len = code_ref.len();
 
-        // 1. Known Malicious Signatures Match
-        for sig in crate::constants::HONEYPOT_BYTECODE_SIGNATURES.iter() {
-            if code_ref.windows(sig.len()).any(|window| window == sig) {
-                return true;
-            }
+        // Pillar H: Whitelist — any contract > 8KB is almost certainly a legitimate DEX pool/router.
+        // Uniswap V3, Aerodrome, Balancer all contain SELFDESTRUCT/DELEGATECALL in proxy patterns.
+        if code_len > 8_000 {
+            return false;
         }
 
-        // 2. Pillar X: X-Ray Scanner - Deep Opcode Analysis
-        // Uses the MALICIOUS_OPCODES set to scan for dangerous instructions.
-        for &opcode in crate::constants::MALICIOUS_OPCODES.iter() {
-            if code_ref.contains(&opcode) {
-                // Special Case: DELEGATECALL (0xf4) is common in high-quality proxies.
-                // We only flag it if the bytecode is suspiciously small (< 5000 bytes).
-                if opcode == 0xf4 && code_ref.len() >= 5000 { continue; }
-                return true;
-            }
-        }
+        // Pillar X: X-Ray scan — only for small/unknown contracts
+        // SELFDESTRUCT (0xff) in a small token contract = definite honeypot
+        if code_ref.contains(&0xff) { return true; }
+        // DELEGATECALL (0xf4) in a tiny contract = suspicious proxy trap
+        if code_ref.contains(&0xf4) && code_len < 3_000 { return true; }
 
-        // 3. Blacklist Pattern Detection (CALLER + SLOAD + REVERT)
-        // यह उन टोकन्स को पकड़ता है जो खास एड्रेस (जैसे हमारा बॉट) के लिए ट्रांसफर रोक देते हैं।
-        let has_caller = code_ref.contains(&0x33); // CALLER
-        let has_sload = code_ref.contains(&0x54);  // SLOAD
-        let has_revert = code_ref.contains(&0xfd) || code_ref.contains(&0xfe);
-
-        if has_caller && has_sload && has_revert && code_ref.len() < 3000 {
-            return true;
+        // Pillar L: CALLER+SLOAD+REVERT pattern — catches address-specific transfer blocks
+        // Only applies to very small contracts to avoid false positives on DEX pools
+        if code_len < 2_000 {
+            let has_caller = code_ref.contains(&0x33); // CALLER opcode
+            let has_sload  = code_ref.contains(&0x54); // SLOAD opcode
+            let has_revert = code_ref.contains(&0xfd) || code_ref.contains(&0xfe);
+            if has_caller && has_sload && has_revert { return true; }
         }
 
         false
     }
 
     /// Pillar B: Sub-block Batch Sync Logic.
-    /// Synchronizes all 3000+ pools in massive batches using Multicall3.
     pub async fn sync_all_pools_multicall<P: Provider<BoxTransport>>(&self, provider: Arc<P>) -> Result<(), crate::models::MEVError> {
         let pool_addresses: Vec<(Address, DexType)> = self.pools.iter().map(|entry| (*entry.key(), entry.value().dex_type)).collect::<Vec<_>>();
         if pool_addresses.is_empty() { return Ok(()); }
@@ -257,7 +239,6 @@ impl StateMirror {
 
         for chunk in pool_addresses.chunks(MULTICALL_BATCH_SIZE) {
             let mut calls = Vec::with_capacity(chunk.len() * 2);
-            
             for (addr, dex_type) in chunk {
                 match dex_type {
                     DexType::UniswapV2 | DexType::Aerodrome => {
@@ -268,16 +249,8 @@ impl StateMirror {
                         });
                     }
                     DexType::UniswapV3 | DexType::MaverickV2 => {
-                        calls.push(Call3 {
-                            target: *addr,
-                            allowFailure: true,
-                            callData: IV3Pool::slot0Call {}.abi_encode().into(),
-                        });
-                        calls.push(Call3 {
-                            target: *addr,
-                            allowFailure: true,
-                            callData: IV3Pool::liquidityCall {}.abi_encode().into(),
-                        });
+                        calls.push(Call3 { target: *addr, allowFailure: true, callData: IV3Pool::slot0Call {}.abi_encode().into() });
+                        calls.push(Call3 { target: *addr, allowFailure: true, callData: IV3Pool::liquidityCall {}.abi_encode().into() });
                     }
                 }
             }
@@ -288,7 +261,6 @@ impl StateMirror {
 
                 for (addr, dex_type) in chunk {
                     let mut state = PoolState { last_updated_block: current_block, dex_type: *dex_type, ..Default::default() };
-                    
                     match dex_type {
                         DexType::UniswapV2 | DexType::Aerodrome => {
                             if let Some(res) = results_iter.next() {
@@ -304,12 +276,10 @@ impl StateMirror {
                         DexType::UniswapV3 | DexType::MaverickV2 => {
                             let slot0_res = results_iter.next();
                             let liq_res = results_iter.next();
-                            
                             if let (Some(s0), Some(l)) = (slot0_res, liq_res) {
                                 if s0.success && l.success {
                                     let s0_dec = IV3Pool::slot0Call::abi_decode_returns(&s0.returnData.0, true);
                                     let l_dec = IV3Pool::liquidityCall::abi_decode_returns(&l.returnData.0, true);
-                                    
                                     if let (Ok(s), Ok(liq)) = (s0_dec, l_dec) {
                                         state.sqrt_price_x96 = U256::from(s.sqrtPriceX96);
                                         state.tick = s.tick.as_i32();
@@ -341,14 +311,16 @@ impl StateMirror {
         let current = self.current_block_number();
         if current == 0 { return; }
         self.pools.retain(|_, pool| {
-            // Remove if no activity for max_age_blocks
-            // If last_updated is 0, it means it's a freshly discovered pool but never traded.
-            // We give it a 100 block grace period before purging.
             let age = if pool.last_updated_block == 0 { 0 } else { current.saturating_sub(pool.last_updated_block) };
-            age <= max_age_blocks && pool.reserves0 > U256::ZERO // Remove empty pools
+            // FIX: Bootstrap pools have reserves=0 until first multicall sync.
+            // Keep pools with last_updated_block=0 (newly seeded, not yet synced by multicall).
+            let is_new_unsync = pool.last_updated_block == 0;
+            let has_data = pool.reserves0 > U256::ZERO || pool.sqrt_price_x96 > U256::ZERO;
+            age <= max_age_blocks && (is_new_unsync || has_data)
         });
-        if self.pools.len() > 2500 { // Stricter limit for Hugging Face RAM
-            self.pools.retain(|_, p| current.saturating_sub(p.last_updated_block) < 5);
+        if self.pools.len() > 2500 {
+            // Keep new unsynced pools + recently active pools
+            self.pools.retain(|_, p| p.last_updated_block == 0 || current.saturating_sub(p.last_updated_block) < 5);
         }
         if self.bytecodes.len() > 500 {
             self.bytecodes.retain(|addr, _| self.pools.contains_key(addr));
@@ -379,7 +351,6 @@ impl StateMirror {
         })
     }
 
-    /// Pillar B: Update multiple pool reserves in a single block using Multicall data.
     pub fn batch_update_reserves(&self, updates: Vec<(Address, PoolState)>) {
         for (addr, state) in updates {
             self.pools.entry(addr)
@@ -387,15 +358,11 @@ impl StateMirror {
                     existing.reserves0 = state.reserves0;
                     existing.reserves1 = state.reserves1;
                     existing.last_updated_block = state.last_updated_block;
-                    
-                    // V3 fields
                     if state.sqrt_price_x96 != U256::ZERO {
                         existing.sqrt_price_x96 = state.sqrt_price_x96;
                         existing.tick = state.tick;
                         existing.liquidity = state.liquidity;
                     }
-
-                    // Pillar Z: Aerodrome Stable Flag persistence from Multicall
                     if state.is_stable {
                         existing.is_stable = true;
                         existing.dex_type = DexType::Aerodrome;
@@ -407,33 +374,30 @@ impl StateMirror {
     }
 
     pub fn update_v2_reserves(&self, address: Address, r0: U256, r1: U256) {
-        self.pools.entry(address)
-            .and_modify(|p| {
-                p.reserves0 = r0;
-                p.reserves1 = r1;
-                p.last_updated_block = self.current_block_number();
-            });
+        self.pools.entry(address).and_modify(|p| {
+            p.reserves0 = r0;
+            p.reserves1 = r1;
+            p.last_updated_block = self.current_block_number();
+        });
         self.mark_dirty();
     }
 
     pub fn update_v3_state(&self, address: Address, sqrt_price: U256, tick: i32, liquidity: U256) {
-        self.pools.entry(address)
-            .and_modify(|p| {
-                p.sqrt_price_x96 = sqrt_price;
-                p.tick = tick;
-                p.liquidity = liquidity;
-                p.last_updated_block = self.current_block_number();
-            });
+        self.pools.entry(address).and_modify(|p| {
+            p.sqrt_price_x96 = sqrt_price;
+            p.tick = tick;
+            p.liquidity = liquidity;
+            p.last_updated_block = self.current_block_number();
+        });
         self.mark_dirty();
     }
 
     pub fn update_aerodrome_stable(&self, address: Address, is_stable: bool) {
-        self.pools.entry(address)
-            .and_modify(|p| {
-                p.is_stable = is_stable;
-                p.dex_type = DexType::Aerodrome;
-                p.last_updated_block = self.current_block_number();
-            });
+        self.pools.entry(address).and_modify(|p| {
+            p.is_stable = is_stable;
+            p.dex_type = DexType::Aerodrome;
+            p.last_updated_block = self.current_block_number();
+        });
         self.mark_dirty();
     }
 }
@@ -442,7 +406,6 @@ impl revm::DatabaseRef for StateMirror {
     type Error = crate::models::MEVError;
 
     fn basic_ref(&self, address: Address) -> Result<Option<revm::primitives::AccountInfo>, Self::Error> {
-        // Zero-Copy: Fetching bytecode reference from DashMap
         if let Some(code) = self.get_bytecode(&address) {
             Ok(Some(revm::primitives::AccountInfo {
                 code_hash: code.hash_slow(),
@@ -460,7 +423,6 @@ impl revm::DatabaseRef for StateMirror {
 
     #[inline(always)]
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        // Nanosecond Optimization: Use get_key_value to avoid double hashing
         Ok(self.storage_cache.get(&(address, index))
             .map(|v: dashmap::mapref::one::Ref<'_, (Address, U256), U256, _>| *v.value()).unwrap_or(U256::ZERO))
     }

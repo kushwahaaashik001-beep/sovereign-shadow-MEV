@@ -53,14 +53,13 @@ impl P2pEngine {
     pub async fn run(&self) -> Result<(), MEVError> {
         info!("📡 [P2P] Engine booting up - Targeted Speed: Sub-millisecond Tx capture");
 
-        // Peer Maintenance Loop: Remove stale peers every 30 seconds
         let stats = self.peer_stats.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
                 interval.tick().await;
                 stats.retain(|addr, peer| {
-                    if peer.connection_time.elapsed() > Duration::from_secs(3600) && 
+                    if peer.connection_time.elapsed() > Duration::from_secs(3600) &&
                        peer.transactions_received.load(Ordering::Relaxed) == 0 {
                         debug!("[P2P] Pruning inactive peer: {}", addr);
                         false
@@ -71,16 +70,10 @@ impl P2pEngine {
             }
         });
 
-        // Placeholder for RLPx discovery - In production, this would connect to enode list
-        if let Err(e) = self.bootstrap_peers().await {
-            warn!("⚠️ [PILLAR Q] P2P Bootstrap failed: {}. Retrying in background...", e);
-        }
-
-        // Pillar Q: Wait for initial mesh stability (at least 1 peer)
-        while self.peer_stats.is_empty() {
-            debug!("[BOOTSTRAP] Waiting for first P2P peer connection...");
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
+        // Pillar T: Non-blocking P2P bootstrap.
+        // If TCP port 30303 is blocked (e.g. Hugging Face Spaces), this fails silently.
+        // WS/RPC mempool feed remains the primary data source.
+        let _ = self.bootstrap_peers().await;
 
         Ok(())
     }
@@ -88,54 +81,69 @@ impl P2pEngine {
     async fn bootstrap_peers(&self) -> Result<(), MEVError> {
         info!("🌐 [P2P] Bootstrapping from Base Mainnet nodes...");
         // Pillar T: Real Enode Pubkeys for Base Mainnet Bootnodes
+        // Note: On Hugging Face Spaces, outbound TCP port 30303 is blocked.
+        // P2P engine will silently fail and WS/RPC remains the primary feed.
         let boot_nodes = vec![
             ("50.18.155.120:30303", "0281891051041d2da47efb938c4948f0bb9b9b5035cc0aa199f38c8a5130b4da567afcc2f66a410179d9adbb673c24cf339cf31fd2df217dfbc2a9115fdcb331"),
             ("3.231.140.210:30303", "816259b334944fca969a4f9d373340125bb03a050ef3a06fcfecba4434bdc9d03b145a34fd551c9d3062ad446da2cfdb10266e06bee30f33ba2a6b410ba2511c"),
         ];
 
-        // Pillar T: Fault-Tolerant P2P Handshakes
         for (addr_str, pubkey_hex) in boot_nodes {
-            let addr: SocketAddr = addr_str.parse().unwrap();
-            let remote_id: [u8; 64] = alloy_primitives::hex::decode(pubkey_hex).unwrap().try_into().unwrap();
+            let addr: SocketAddr = match addr_str.parse() {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            let remote_id_bytes = match alloy_primitives::hex::decode(pubkey_hex) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let remote_id: [u8; 64] = match remote_id_bytes.try_into() {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
             let stats = self.peer_stats.clone();
             let tx_sender = self.tx_sender.clone();
             let secret_key = self.secret_key;
 
             tokio::spawn(async move {
                 loop {
+                    // Pillar T: Graceful P2P - if TCP blocked (HF Spaces), just retry silently
                     let connect_res = tokio::time::timeout(
-                        Duration::from_secs(5), 
+                        Duration::from_secs(5),
                         TcpStream::connect(addr)
                     ).await;
-                    
-                    if let Ok(Ok(stream)) = connect_res {
-                        debug!("[P2P] TCP established with {}. Initiating RLPx Auth...", addr);
-                        
-                        if let Ok(eth_stream) = Self::initiate_peer_session(stream, &secret_key, remote_id).await {
-                            stats.insert(addr, PeerStats {
-                                transactions_received: AtomicU64::new(0),
-                                errors: AtomicU64::new(0),
-                                remote_id: Some(remote_id),
-                                connection_time: Instant::now(),
-                                last_ping: Arc::new(tokio::sync::Mutex::new(Instant::now())),
-                            });
-                            info!("[P2P] Handshake Success with {}", addr);
-                            
-                            // Loop waits for connection to drop before retrying
-                            let tx_sender_inner = tx_sender.clone();
-                            let _ = Self::handle_peer_messages(eth_stream, tx_sender_inner, addr, stats.clone()).await;
-                            warn!("[P2P] Connection with {} lost. Retrying in 5s...", addr);
-                        } else {
-                            error!("[P2P] Handshake failed with {}. Retrying in 10s...", addr);
+
+                    match connect_res {
+                        Ok(Ok(stream)) => {
+                            debug!("[P2P] TCP established with {}. Initiating RLPx Auth...", addr);
+                            if let Ok(eth_stream) = Self::initiate_peer_session(stream, &secret_key, remote_id).await {
+                                stats.insert(addr, PeerStats {
+                                    transactions_received: AtomicU64::new(0),
+                                    errors: AtomicU64::new(0),
+                                    remote_id: Some(remote_id),
+                                    connection_time: Instant::now(),
+                                    last_ping: Arc::new(tokio::sync::Mutex::new(Instant::now())),
+                                });
+                                info!("[P2P] Handshake Success with {}", addr);
+                                let tx_sender_inner = tx_sender.clone();
+                                let _ = Self::handle_peer_messages(eth_stream, tx_sender_inner, addr, stats.clone()).await;
+                                warn!("[P2P] Connection with {} lost. Retrying in 30s...", addr);
+                            } else {
+                                debug!("[P2P] Handshake failed with {}. Retrying in 30s...", addr);
+                            }
                         }
-                    } else {
-                        debug!("[P2P] Failed to connect to {}. Retrying in 10s...", addr);
+                        // TCP blocked or timeout - silent retry, don't spam logs
+                        _ => {
+                            debug!("[P2P] Cannot reach {} (port may be blocked). Retrying in 60s...", addr);
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                            continue;
+                        }
                     }
-                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
                 }
             });
         }
-        
+
         Ok(())
     }
 
