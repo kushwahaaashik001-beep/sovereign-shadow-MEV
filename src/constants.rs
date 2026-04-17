@@ -24,6 +24,12 @@ pub const TOKEN_USDT:   Address = addr!("fde4C96c8593536E31F229EA8f37b2ADa2699bb
 pub const TOKEN_BRETT:  Address = addr!("532f27101965dd16442E59d40670Fa5ad5f3fe91");
 pub const TOKEN_WETH:   Address = addr!("4200000000000000000000000000000000000006");
 pub const TOKEN_USDC:   Address = addr!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+pub const TOKEN_VIRTUAL: Address = addr!("0x0bFbCF9fa4f9C56B0F40a671Ad40E0805A091865");
+pub const TOKEN_AIXBT:   Address = addr!("0x4F9Fd6Be4a90f2620860d680c0d4d5Fb53d1A84E");
+pub const TOKEN_HIGHER:  Address = addr!("0x057871A20512f5343046bc3A531557d903698064");
+pub const TOKEN_LUNA:    Address = addr!("0xD533a949740bb3306d119CC777fa900bA034cd52");
+pub const TOKEN_MOXIE:   Address = addr!("0x8E903254580327429402f0D4f907693998D654b9");
+pub const TOKEN_AI16Z:   Address = addr!("0x30c90069678174577B0Ac49969D7070F7915B597");
 
 pub const POOL_UNIV3_WETH_USDC_005: Address = addr!("d0b53D9277642d899DF5C87A3966A349A798F224");
 pub const POOL_UNIV3_WETH_USDC_030: Address = addr!("4C36388bE6F416A29C8d8Eee819bb35ed3737a01");
@@ -45,6 +51,8 @@ pub const MIN_NET_PROFIT_USD_WEI:   u128 = 60_000_000_000_000; // Scavenger: $0.
 // Alpha Hunter: Sweet Spot Liquidity Range ($2k - $30k)
 pub const MIN_ALPHA_LIQUIDITY_USD: u128 = 300; // Micro-liquidity capture for stealth arbs
 pub const MAX_ALPHA_LIQUIDITY_USD: u128 = 40_000; 
+pub const MIN_AI_LIQUIDITY_USD:    u128 = 10_000; // Strict filter for high-risk AI tokens
+pub const MAX_AI_TAX_BPS:          u64 = 100;     // 1% max tax for AI cluster
 pub const ESTIMATED_ETH_PRICE: u128 = 2_500; // Used for quick in-memory liquidity filtering
 
 pub const POOL_HOTNESS_TTL_SEC: u64 = 1800; // 30 minutes for Autonomous Discovery

@@ -300,6 +300,15 @@ impl MathEngine {
         x
     }
 
+    /// Pillar D: Liquidity Skew Detection
+    /// Measures the imbalance between reserves. High skew indicates a recent large trade
+    /// and a high probability of an arbitrage opportunity.
+    pub fn calculate_liquidity_skew(&self, r0: U256, r1: U256) -> f64 {
+        if r0.is_zero() || r1.is_zero() { return 0.0; }
+        let ratio = r0.to::<u128>() as f64 / r1.to::<u128>() as f64;
+        if ratio < 1.0 { 1.0 / ratio } else { ratio }
+    }
+
     pub fn calculate_optimal_v2_v2(
         r1_in: U256, r1_out: U256, r2_in: U256, r2_out: U256,
         fee1_bps: u32, fee2_bps: u32,

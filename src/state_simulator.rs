@@ -290,8 +290,12 @@ impl StateSimulator {
             let received = self.get_erc20_balance(&mut evm, token, recipient)?;
             let tax_bps = (amount_in_wei.saturating_sub(received) * U256::from(10000)) / amount_in_wei.max(U256::from(1));
             let tax_u64 = tax_bps.to::<u64>();
-            if tax_u64 > crate::constants::MAX_ALLOWED_TAX_BPS {
-                return Err(MEVError::HoneypotDetected(format!("HIGH_TAX: {} BPS detected", tax_u64)));
+            
+            let is_ai = token == crate::constants::TOKEN_VIRTUAL || token == crate::constants::TOKEN_LUNA || token == crate::constants::TOKEN_AI16Z;
+            let max_tax = if is_ai { crate::constants::MAX_AI_TAX_BPS } else { crate::constants::MAX_ALLOWED_TAX_BPS };
+
+            if tax_u64 > max_tax {
+                return Err(MEVError::HoneypotDetected(format!("HIGH_TAX: {} BPS detected (Max: {})", tax_u64, max_tax)));
             }
             return Ok(tax_u64);
         }

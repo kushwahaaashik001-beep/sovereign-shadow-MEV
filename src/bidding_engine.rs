@@ -65,6 +65,22 @@ impl BiddingEngine {
             self.last_pressure_update.store(Arc::new(now));
         }
 
+        // AI Alpha Hunter: Aggressive Bidding for high-volatility AI tokens
+        // If the path contains AI stars, we go for 95% bribe to guarantee inclusion.
+        let mut path_contains_ai = false;
+        for hop in &opp.path.hops {
+            if hop.token_in == crate::constants::TOKEN_VIRTUAL || hop.token_out == crate::constants::TOKEN_VIRTUAL ||
+               hop.token_in == crate::constants::TOKEN_LUNA || hop.token_out == crate::constants::TOKEN_LUNA ||
+               hop.token_in == crate::constants::TOKEN_AI16Z || hop.token_out == crate::constants::TOKEN_AI16Z {
+                path_contains_ai = true;
+                break;
+            }
+        }
+
+        if path_contains_ai {
+            return 95.min(MAX_BRIBE_PCT);
+        }
+
         // 1. Predator Detection (Pillar H)
         if self.is_predator_active(opp) {
             self.predator_hits.fetch_add(1, Ordering::Relaxed);
@@ -139,6 +155,12 @@ impl BiddingEngine {
         let mut suggested = current_priority;
 
         let is_mafia = self.last_heat_score.load(Ordering::Relaxed) > 50 || self.consecutive_losses.load(Ordering::Relaxed) > 3;
+
+        // Strict Gas Price Cap: 0.1 gwei (100,000,000 wei)
+        let base_fee = self.state_mirror.current_base_fee();
+        if base_fee > U256::from(100_000_000u64) {
+            return U256::ZERO; // Abort: Gas too expensive for $3 budget
+        }
 
         if let Some(comp_gas) = opp.trigger_gas_price {
             // Adaptive overshoot: Beat competitors by 2 gwei (4 gwei in Mafia Mode)

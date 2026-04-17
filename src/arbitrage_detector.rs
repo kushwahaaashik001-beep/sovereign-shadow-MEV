@@ -207,6 +207,24 @@ impl ArbitrageDetector {
             FxHashMap::default()
         };
 
+        // AI Alpha Hunter: Specific Liquidity Skew Detection
+        // If an AI pool is heavily skewed (>3% imbalance), we treat it as a high-alpha signal.
+        let is_ai_pool = event.swap_info.token_in == constants::TOKEN_VIRTUAL || event.swap_info.token_out == constants::TOKEN_VIRTUAL ||
+                         event.swap_info.token_in == constants::TOKEN_LUNA || event.swap_info.token_out == constants::TOKEN_LUNA ||
+                         event.swap_info.token_in == constants::TOKEN_AI16Z || event.swap_info.token_out == constants::TOKEN_AI16Z;
+
+        if is_ai_pool {
+            if let Some(state) = state_mirror.get_pool_data(&event.swap_info.router, 1) {
+                let skew = math.calculate_liquidity_skew(state.reserves0, state.reserves1);
+                if skew > 1.03 { // > 3% shift
+                    info!("🎯 [AI-SKEW] High volatility detected in AI pool {:?}. Skew: {:.4}. Prioritizing search.", 
+                        event.swap_info.router, skew);
+                    // Force pool activity update to ensure it stays in graph
+                    self.pool_activity.insert(event.swap_info.router, std::time::Instant::now());
+                }
+            }
+        }
+
         // Pillar C: Multi-Directional Back-running Search (In-Memory Math)
         let mut search_directions = Vec::new();
 
@@ -480,7 +498,16 @@ impl ArbitrageDetector {
                     liq_usd = (pool_state.reserves1.to::<u128>() / 10u128.pow(18)) * 2 * constants::ESTIMATED_ETH_PRICE;
                 }
 
-                let is_in_sweet_spot = liq_usd >= constants::MIN_ALPHA_LIQUIDITY_USD && liq_usd <= constants::MAX_ALPHA_LIQUIDITY_USD;
+                // AI Alpha Logic: Verified AI stars require higher liquidity ($10k+)
+                let is_ai_star = t0 == constants::TOKEN_VIRTUAL || t1 == constants::TOKEN_VIRTUAL || 
+                                 t0 == constants::TOKEN_LUNA || t1 == constants::TOKEN_LUNA ||
+                                 t0 == constants::TOKEN_AI16Z || t1 == constants::TOKEN_AI16Z;
+
+                let is_in_sweet_spot = if is_ai_star {
+                    liq_usd >= constants::MIN_AI_LIQUIDITY_USD && liq_usd <= constants::MAX_ALPHA_LIQUIDITY_USD
+                } else {
+                    is_core || (liq_usd >= constants::MIN_ALPHA_LIQUIDITY_USD && liq_usd <= constants::MAX_ALPHA_LIQUIDITY_USD)
+                };
 
                 // Predator Filter: Skip congested pools during graph rebuild to avoid high-competition paths
                 if self.state_mirror.is_congested(pool_addr, 5) {

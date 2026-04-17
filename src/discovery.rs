@@ -47,19 +47,18 @@ impl Discovery {
 
                 // The "Scavenger Bridge": Degen to Ecosystem
                 // Ye rasta bade bots kabhi scan nahi karte.
-                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_DEGEN, token_1: constants::TOKEN_AERO, pair: alloy_primitives::address!("0x532f27101965dd16442E59d40670Fa5ad5f3fe91"), dex_name: DexName::BaseSwap }),
+                // AI & Social Alpha Hubs
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: alloy_primitives::address!("0x0bFbCF9fa4f9C56B0F40a671Ad40E0805A091865"), pair: alloy_primitives::address!("0x3062ad446da2cfdb10266e06bee30f33ba2a6b41"), dex_name: DexName::Aerodrome }), // VIRTUAL/WETH
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: alloy_primitives::address!("0x4F9Fd6Be4a90f2620860d680c0d4d5Fb53d1A84E"), pair: alloy_primitives::address!("0x15263a6a1251d75cdf2de83a1251d75cdf2de83a"), dex_name: DexName::UniswapV2 }), // AIXBT
                 
-                // Alpha Cluster: VIRTUAL & Gaming Alpha (High Volatility)
-                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: alloy_primitives::address!("0x0bFbCF9fa4f9C56B0F40a671Ad40E0805A091865"), pair: alloy_primitives::address!("0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"), dex_name: DexName::PancakeSwap }),
-                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: alloy_primitives::address!("0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed"), pair: alloy_primitives::address!("0x3D2d7681335A74Be482D207137f814bA688849E8"), dex_name: DexName::UniswapV2 }), // AlienBase
-
-                // Gaming/Meme Alpha Bridge
-                NewPoolEvent::V2(V2PoolData { 
-                    token_0: constants::TOKEN_WETH, 
-                    token_1: alloy_primitives::address!("0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed"), // DEGEN 
-                    pair: alloy_primitives::address!("0x3D2d7681335A74Be482D207137f814bA688849E8"), 
-                    dex_name: DexName::UniswapV2 
-                }),
+                // Ecosystem Triangular Seeds
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_DEGEN, token_1: constants::TOKEN_AERO, pair: alloy_primitives::address!("0x532f27101965dd16442E59d40670Fa5ad5f3fe91"), dex_name: DexName::BaseSwap }),
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_LUNA, pair: alloy_primitives::address!("0x4200000000000000000000000000000000000006"), dex_name: DexName::Aerodrome }),
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_AI16Z, pair: alloy_primitives::address!("0x30c90069678174577B0Ac49969D7070F7915B597"), dex_name: DexName::UniswapV2 }),
+                
+                // Multi-DEX Path Inflation (AlienBase, SwapBased, Sushi)
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_USDC, pair: alloy_primitives::address!("0x04C9F118A4864700721A163744021d21DB27c11f"), dex_name: DexName::UniswapV2 }), // SwapBased
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_USDC, pair: alloy_primitives::address!("0x3D2d7681335A74Be482D207137f814bA688849E8"), dex_name: DexName::UniswapV2 }), // AlienBase
             ];
 
             let mut count = 0;

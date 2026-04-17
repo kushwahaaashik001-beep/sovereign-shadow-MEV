@@ -206,6 +206,15 @@ impl FlashLoanExecutor {
         let adjusted_total_cost = l1_buffer + l2_execution_fee;
         
         let current_balance = self.circuit_breaker.get_cached_balance();
+
+        // Budget Protection Rule: Gas cost must be < 10% of total balance.
+        // This prevents a single high-gas trade from depleting our survival fund ($3 budget limit).
+        let budget_cap = current_balance / U256::from(10);
+        if !current_balance.is_zero() && adjusted_total_cost > budget_cap {
+            warn!("🛡️ [BUDGET PROTECT] Trade rejected: Gas cost ({}) exceeds 10% of balance (Cap: {})", adjusted_total_cost, budget_cap);
+            return Err(MEVError::SimulationFailed("Gas cost exceeds safety budget cap".into()));
+        }
+        
         let scavenger_threshold = U256::from(50_000_000_000_000_000u128); // 0.05 ETH
         
         let _survival_multiplier = if current_balance > scavenger_threshold {
@@ -235,13 +244,9 @@ impl FlashLoanExecutor {
 
         // Pillar Y: Dynamic Scavenger Filter
         // Instead of a hard $2, we scale based on current network congestion.
-        // Scavenger Chaal: Targeting $0.15 - $0.50 range for $2 budget sustainability.
-        let current_gas_price = total_gas_price;
-        let min_threshold = if current_gas_price < U256::from(500_000_000u64) { // Gas < 0.5 gwei
-            U256::from(60_000_000_000_000u128) // $0.15 minimum (Scavenger Mode)
-        } else {
-            U256::from(200_000_000_000_000u128) // $0.50 during high gas
-        };
+        // Survival Mode: Strict Profit Threshold for $3 Budget.
+        // We only fire if Net Profit > $0.50 (approx 200,000,000,000,000 wei).
+        let min_threshold = U256::from(200_000_000_000_000u128); // $0.50 Minimum Profit
 
         if net_profit < min_threshold {
             return Err(MEVError::SimulationFailed(format!(
