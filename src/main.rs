@@ -42,6 +42,19 @@ fn parse_address_robust(s: &str) -> Address {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // Dummy Server for Hugging Face Health Check
+    // Hugging Face expects a web server on port 7860 to keep the Space alive.
+    std::thread::spawn(|| {
+        let listener = std::net::TcpListener::bind("0.0.0.0:7860").unwrap();
+        println!("📢 Dummy Web Server started on port 7860 for Hugging Face");
+        for stream in listener.incoming() {
+            if let Ok(mut stream) = stream {
+                let response = "HTTP/1.1 200 OK\r\n\r\nSovereign Shadow is LIVE!";
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+        }
+    });
+
     let core_ids = core_affinity::get_core_ids().expect("Failed to get core IDs");
     let core_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 

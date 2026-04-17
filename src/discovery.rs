@@ -77,8 +77,9 @@ impl Discovery {
         // Background task to prevent blocking the main engine startup
         tokio::spawn(async move {
             let current_block = provider.get_block_number().await.unwrap_or_default();
-            // Alpha Hunter Look-Back: Scanning last 10,000 blocks (~5.5 hours) for new pools
-            let start_block = current_block.saturating_sub(10_000); 
+            // Alpha Hunter Look-Back: Reduced to 100 blocks for Free RPC compatibility (Chainstack/Quicknode).
+            // Paid Archive Nodes are required for deeper historical scans (>128 blocks).
+            let start_block = current_block.saturating_sub(100); 
 
             let v2_topic = B256::from(constants::EVENT_V2_PAIR_CREATED);
             let v3_topic = B256::from(constants::EVENT_V3_POOL_CREATED);
@@ -134,7 +135,15 @@ impl Discovery {
                     }
                     if count > 0 { info!("✅ [ALPHA-LOOKBACK] Seeding complete. Injected {} historical pools.", count); }
                 }
-                Err(e) => error!("❌ [ALPHA-LOOKBACK] Historical scan failed: {}", e),
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    // Handle Archive Plan limitation gracefully
+                    if err_msg.contains("-32002") || err_msg.contains("Archive") || err_msg.contains("limit") {
+                        warn!("⚠️ [ALPHA-LOOKBACK] Historical scan restricted by RPC plan (Chainstack/Quicknode). Discovery will rely on bootstrap pools and real-time logs.");
+                    } else {
+                        error!("❌ [ALPHA-LOOKBACK] Historical scan failed: {}", err_msg);
+                    }
+                }
             }
             info!("🏁 [PILLAR Z] Warm Start process complete.");
         });
