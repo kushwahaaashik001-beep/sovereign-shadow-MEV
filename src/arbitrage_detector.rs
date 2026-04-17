@@ -193,6 +193,12 @@ impl ArbitrageDetector {
         let graph = self.graph.load().clone();
         let config = self.config.clone();
 
+        // Alpha Hunter: Predator Filter
+        // Skip processing if the trigger pool is already congested with bots.
+        if self.state_mirror.is_congested(&event.swap_info.router, 5) {
+            return;
+        }
+
         // Pillar T: Sub-block State Projection
         let impacts = if let Some(ref mempool_tx) = event.mempool_tx {
             if event.swap_info.amount_in < U256::from(2 * 10u128.pow(16)) { return; } // < 0.02 ETH
@@ -446,11 +452,34 @@ impl ArbitrageDetector {
                     .map(|t| t.elapsed().as_secs() < 1800) // 30 minutes
                     .unwrap_or(false);
 
-                if !is_core && !is_hot && !is_alpha { continue; }
+                // Sweet Spot Filter: Estimate USD Liquidity to avoid whales and tiny scams
+                let pool_state = entry.value();
+                let mut liq_usd = 0u128;
+                if t0 == constants::TOKEN_USDC {
+                    liq_usd = (pool_state.reserves0.to::<u128>() / 1_000_000) * 2;
+                } else if t1 == constants::TOKEN_USDC {
+                    liq_usd = (pool_state.reserves1.to::<u128>() / 1_000_000) * 2;
+                } else if t0 == constants::TOKEN_WETH {
+                    liq_usd = (pool_state.reserves0.to::<u128>() / 10u128.pow(18)) * 2 * constants::ESTIMATED_ETH_PRICE;
+                } else if t1 == constants::TOKEN_WETH {
+                    liq_usd = (pool_state.reserves1.to::<u128>() / 10u128.pow(18)) * 2 * constants::ESTIMATED_ETH_PRICE;
+                }
 
-                // Focus strictly on Backrunning Aerodrome and Uniswap V3
-                if dex != DexName::Aerodrome && dex != DexName::UniswapV3 {
+                let is_in_sweet_spot = liq_usd >= constants::MIN_ALPHA_LIQUIDITY_USD && liq_usd <= constants::MAX_ALPHA_LIQUIDITY_USD;
+
+                // Predator Filter: Skip congested pools during graph rebuild to avoid high-competition paths
+                if self.state_mirror.is_congested(pool_addr, 5) {
                     continue;
+                }
+
+                // Alpha Hunter Logic:
+                // Core pools ko hamesha rakhte hain routing ke liye. 
+                // Alpha pools ko tabhi rakhte hain jab wo Sweet Spot liquidity range mein hon.
+                if !is_core {
+                    let is_niche_dex = dex == DexName::SushiSwap || dex == DexName::BaseSwap || dex == DexName::PancakeSwap;
+                    let should_include = (is_hot || is_alpha || is_niche_dex) && is_in_sweet_spot;
+                    
+                    if !should_include { continue; }
                 }
 
                 pool_list.push(*pool_addr);

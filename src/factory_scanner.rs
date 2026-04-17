@@ -105,6 +105,9 @@ impl FactoryScanner {
                 // Add SwapBased and AlienBase for extra Alpha
                 map.insert("0x04C9F118A4864700721A163744021d21DB27c11f".parse().unwrap(), DexName::UniswapV2); // SwapBased
                 map.insert("0x3D2d7681335A74Be482D207137f814bA688849E8".parse().unwrap(), DexName::UniswapV2); // AlienBase
+                // Alpha Hunter: Add BaseSwap V3 for un-sniped V3 arbs
+                map.insert(constants::BASE_BASESWAP_FACTORY, DexName::UniswapV3);
+                map.insert(constants::BASE_MAVERICK_FACTORY, DexName::Maverick);
             }
         }
     }

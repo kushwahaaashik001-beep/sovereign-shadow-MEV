@@ -40,7 +40,12 @@ pub const POOL_AERO_WETH_AERO:      Address = addr!("7f670f78B17dEC44d5Ef68a4874
 pub const POOL_AERO_WETH_BRETT:     Address = addr!("532f27101965dd16442E59d40670Fa5ad5f3fe91");
 
 pub const MOONWELL_COMPTROLLER:     Address = addr!("BBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb");
-pub const MIN_NET_PROFIT_USD_WEI:   u128 = 150_000_000_000_000; // Lowered to $0.35 to capture high-volume micro-swaps
+pub const MIN_NET_PROFIT_USD_WEI:   u128 = 80_000_000_000_000; // Alpha Hunter: Targetting $0.20+ for micro-scalping
+
+// Alpha Hunter: Sweet Spot Liquidity Range ($2k - $30k)
+pub const MIN_ALPHA_LIQUIDITY_USD: u128 = 2_000;
+pub const MAX_ALPHA_LIQUIDITY_USD: u128 = 30_000;
+pub const ESTIMATED_ETH_PRICE: u128 = 2_500; // Used for quick in-memory liquidity filtering
 
 pub const POOL_HOTNESS_TTL_SEC: u64 = 1800; // 30 minutes for Autonomous Discovery
 
@@ -114,7 +119,7 @@ pub const AAVE_V3_POOL:   Address = addr!("A238Dd80C259a72e81d7e4664a9801593F98d
 pub const MAX_TICK_CROSSES: usize = 256;
 pub const SIMULATION_GAS_LIMIT: u64 = 600_000;
 pub const SIMULATION_VERBOSE: bool = false;
-pub const MAX_HOPS: usize = 5; // Multi-hop logic ke liye depth badha di gayi hai
+pub const MAX_HOPS: usize = 6; // Alpha Hunter: Deep 6-hop cycles for obscure meme paths
 pub const TOP_N_TOKENS: usize = 50;
 pub const PATH_CACHE_TTL_MS: u64 = 5000;
 pub const GSS_TOLERANCE_WEI: u128 = 1_000_000_000_000;
@@ -284,6 +289,10 @@ pub const BASE_BASESWAP_ROUTER:     Address = addr!("327Df1E4de51d9752a3e019c42e
 pub const BASE_MAVERICK_FACTORY:    Address = addr!("3708D64936496924f2b1853B0287515089304386");
 pub const BASE_MAVERICK_ROUTER:     Address = addr!("792376e191C802a466D57b545f8f85f340807551");
 pub const BASE_UNISWAP_V3_ROUTER_SR2: Address = addr!("262136065839E9905E990867056E137f866A4839");
+
+// Alpha Hunter: Additional Niche Factories (Low Competition)
+pub const BASE_SWAPBASED_FACTORY:   Address = addr!("04C9F118A4864700721A163744021d21DB27c11f");
+pub const BASE_ALIENBASE_FACTORY:   Address = addr!("3D2d7681335A74Be482D207137f814bA688849E8");
 
 pub const TARGET_ROUTERS: [Address; 4] = [
     BASE_AERODROME_ROUTER,

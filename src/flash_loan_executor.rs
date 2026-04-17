@@ -42,6 +42,7 @@ pub struct FlashLoanExecutor {
     bidding_engine:       Arc<BiddingEngine>,
     l1_calc:              Arc<L1DataFeeCalculator>,
     pub occupied_pools:   Arc<DashMap<(u64, Address), String>>, // Pillar SEQ: (Block, Pool) -> OppID
+    vetted_tokens:        Arc<DashMap<Address, bool>>,         // Speed: Skip honeypot for known safe tokens
 }
 
 impl FlashLoanExecutor {
@@ -64,6 +65,7 @@ impl FlashLoanExecutor {
             bribe_percent, nonce_manager, circuit_breaker,
             state_simulator, bidding_engine, l1_calc,
             occupied_pools: Arc::new(DashMap::new()),
+            vetted_tokens: Arc::new(DashMap::new()),
         })
     }
 
@@ -81,13 +83,18 @@ impl FlashLoanExecutor {
             return Err(MEVError::CircuitBreakerOpen);
         }
 
-        // Pillar SEQ: Bundle Sequencer - Collision Detection
+        // Pillar SEQ: Bundle Sequencer - Immediate Collision Locking
         for hop in &opp.path.hops {
             if let Some(existing_opp) = self.occupied_pools.get(&(target_block, hop.pool_address)) {
                 warn!("⚠️ [SEQUENCER] Collision detected: opp={} uses pool {:?} already occupied by opp={}", 
                     opp.id, hop.pool_address, existing_opp.value());
                 return Err(MEVError::Other("Self-collision detected".into()));
             }
+        }
+        
+        // Lock pools early to prevent redundant simulations of overlapping paths
+        for hop in &opp.path.hops {
+            self.occupied_pools.insert((target_block, hop.pool_address), opp.id.clone());
         }
 
         // Pillar T: Anti-Drift Guardian. 
@@ -108,24 +115,44 @@ impl FlashLoanExecutor {
         }
         futures::future::join_all(fetch_tasks).await;
 
-        // Pillar H: Predator Detection + Pillar L: Honeypot Check
+        // Execution Speed Optimization: Concurrent Validation & Simulation
+        // Honeypot checks are heavy; running them in parallel with simulations saves precious milliseconds.
+        let mut validation_tasks = Vec::new();
         for hop in &opp.path.hops {
-            self.state_simulator.check_honeypot(hop.token_out, hop.pool_address, opp.input_amount)?;
+            if !self.vetted_tokens.contains_key(&hop.token_out) && !crate::constants::CORE_TOKENS.contains(&hop.token_out) {
+                let sim = self.state_simulator.clone();
+                let token = hop.token_out;
+                let pool = hop.pool_address;
+                let amount = opp.input_amount;
+                validation_tasks.push(tokio::spawn(async move {
+                    sim.check_honeypot(token, pool, amount)
+                }));
+            }
         }
 
-        // Pillar M: Ultra-Fast Parallel Lender Selection (Aave V3 vs Balancer)
         let mut sim_tasks = Vec::new();
         for lender in [Lender::Balancer, Lender::AaveV3] {
             let calldata = self.build_calldata_with_lender(opp, lender)?;
             let simulator = self.state_simulator.clone();
             let opp_clone = opp.clone();
             let contract = self.contract_address;
-            let dummy_caller = alloy_primitives::address!("0x000000000000000000000000000000000000dEaD");
+            let caller = self.nonce_manager.address;
             
             sim_tasks.push(tokio::spawn(async move {
-                let results = simulator.run_branch_simulation(&opp_clone, opp_clone.input_amount, calldata.clone(), contract, dummy_caller).await;
+                let results = simulator.run_branch_simulation(&opp_clone, opp_clone.input_amount, calldata.clone(), contract, caller).await;
                 (lender, calldata, results)
             }));
+        }
+
+        // Await validations first (fail fast)
+        for v_task in validation_tasks {
+            if let Ok(Err(e)) = v_task.await {
+                return Err(e);
+            }
+        }
+        // Cache successful validations to skip next time
+        for hop in &opp.path.hops {
+            self.vetted_tokens.insert(hop.token_out, true);
         }
 
         let sim_outputs = futures::future::join_all(sim_tasks).await;
@@ -255,11 +282,6 @@ impl FlashLoanExecutor {
         let signed_tx = tx_request.build(&wallet).await
             .map_err(|e| MEVError::Other(format!("FlashLoan Signing Failed: {}", e)))?;
         
-        // Mark pools as occupied for this block before broadcasting
-        for hop in &opp.path.hops {
-            self.occupied_pools.insert((target_block, hop.pool_address), opp.id.clone());
-        }
-
         let signed_rlp = signed_tx.encoded_2718(); // Requires Encodable2718 trait
         let tx_hash = *signed_tx.tx_hash(); // Bug Fix: use tx_hash()
         

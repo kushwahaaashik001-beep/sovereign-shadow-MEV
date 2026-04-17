@@ -183,6 +183,17 @@ impl StateMirror {
         if entry.len() > 100 { entry.clear(); }
     }
 
+    /// Pillar X: Competition Analytics
+    /// Returns the number of unique addresses (potential bots/traders) interacting with a pool.
+    pub fn get_competition_score(&self, pool: &Address) -> usize {
+        self.trader_registry.get(pool).map(|set| set.len()).unwrap_or(0)
+    }
+
+    /// Predator Filter: Returns true if the pool is overcrowded with other bots.
+    pub fn is_congested(&self, pool: &Address, max_bots: usize) -> bool {
+        self.get_competition_score(pool) >= max_bots
+    }
+
     pub fn update_sync_filter(&self, filter: FxHashSet<Address>) {
         self.sync_filter.store(Arc::new(filter));
     }

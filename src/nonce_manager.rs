@@ -11,7 +11,7 @@ use crate::models::MEVError;
 pub struct NonceManager {
     current:  Arc<AtomicU64>,
     provider: Arc<RootProvider<BoxTransport>>,
-    address:  Address,
+    pub address:  Address,
 }
 
 impl NonceManager {

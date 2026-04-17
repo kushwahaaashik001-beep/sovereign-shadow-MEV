@@ -77,51 +77,64 @@ impl Discovery {
         // Background task to prevent blocking the main engine startup
         tokio::spawn(async move {
             let current_block = provider.get_block_number().await.unwrap_or_default();
-            // Further reduced range to 500 blocks for free-tier RPC stability
-            let start_block = current_block.saturating_sub(500); // Keep this small to avoid RPC limits
+            // Alpha Hunter Look-Back: Scanning last 10,000 blocks (~5.5 hours) for new pools
+            let start_block = current_block.saturating_sub(10_000); 
 
             let v2_topic = B256::from(constants::EVENT_V2_PAIR_CREATED);
+            let v3_topic = B256::from(constants::EVENT_V3_POOL_CREATED);
+            let aero_topic = alloy_primitives::fixed_bytes!("0x212847ad1f2f1ad0d76077f4a7f5f3e728cc2ac818eb64fed8004e115fbcca67");
 
-            let mut current_start = start_block;
-            let step = 500; // Smaller chunks to prevent timeouts and RPC rejections
+            // Single RPC call for 10,000 blocks range as requested to stay under rate limits
+            let filter = Filter::new()
+                .from_block(start_block)
+                .to_block(current_block)
+                .event_signature(vec![v2_topic, v3_topic, aero_topic]);
 
-            while current_start < current_block {
-                let current_end = (current_start + step).min(current_block);
-                let filter = Filter::new()
-                    .from_block(current_start)
-                    .to_block(current_end)
-                    .event_signature(vec![v2_topic]); // Target only V2-style Meme Factories
-
-                match provider.get_logs(&filter).await {
-                    Ok(logs) => {
-                        let mut count = 0;
-                        for log in logs {
-                            let data = log.data().data.as_ref();
-                            let topics = log.topics();
-                            if !topics.is_empty() && topics[0] == v2_topic && topics.len() >= 3 {
-                                let token0 = Address::from_word(topics[1]);
-                                let token1 = Address::from_word(topics[2]);
-                                if data.len() >= 32 {
-                                    let pair = Address::from_slice(&data[12..32]);
-                                    let _ = pool_tx.send(NewPoolEvent::V2(V2PoolData { 
-                                        token_0: token0, token_1: token1, pair, dex_name: DexName::UniswapV2 
-                                    }));
-                                    count += 1;
-                                }
+            match provider.get_logs(&filter).await {
+                Ok(logs) => {
+                    let mut count = 0;
+                    for log in logs {
+                        let data = log.data().data.as_ref();
+                        let topics = log.topics();
+                        if topics.is_empty() { continue; }
+                        
+                        let topic0 = topics[0];
+                        
+                        if topic0 == v2_topic && topics.len() >= 3 {
+                            let token0 = Address::from_word(topics[1]);
+                            let token1 = Address::from_word(topics[2]);
+                            if data.len() >= 32 {
+                                let pair = Address::from_slice(&data[12..32]);
+                                let _ = pool_tx.send(NewPoolEvent::V2(V2PoolData { 
+                                    token_0: token0, token_1: token1, pair, dex_name: DexName::UniswapV2 
+                                }));
+                                count += 1;
+                            }
+                        } else if topic0 == v3_topic && topics.len() >= 3 {
+                            let token0 = Address::from_word(topics[1]);
+                            let token1 = Address::from_word(topics[2]);
+                            if data.len() >= 64 {
+                                let pool = Address::from_slice(&data[44..64]);
+                                let _ = pool_tx.send(NewPoolEvent::V3(crate::factory_scanner::V3PoolData {
+                                    pool, token_0: token0, token_1: token1, fee: 0, dex_name: DexName::UniswapV3
+                                }));
+                                count += 1;
+                            }
+                        } else if topic0 == aero_topic && topics.len() >= 3 {
+                            let token0 = Address::from_word(topics[1]);
+                            let token1 = Address::from_word(topics[2]);
+                            if data.len() >= 32 {
+                                let pool = Address::from_slice(&data[12..32]);
+                                let _ = pool_tx.send(NewPoolEvent::V2(V2PoolData { 
+                                    pair: pool, token_0: token0, token_1: token1, dex_name: DexName::Aerodrome 
+                                }));
+                                count += 1;
                             }
                         }
-                        if count > 0 { info!("✅ [PILLAR Z] Injected {} pools from historical blocks.", count); }
                     }
-                    Err(e) => {
-                        let err_msg = e.to_string();
-                        if err_msg.contains("-32002") || err_msg.contains("Archive") || err_msg.contains("limit") {
-                            warn!("⚠️ [PILLAR Z] Historical scan restricted by RPC plan (Chainstack/Alchemy). Discovery will rely on bootstrap pools and real-time logs.");
-                            break;
-                        }
-                        error!("❌ [PILLAR Z] Warm Start chunk scan failed: {}", err_msg);
-                    }
+                    if count > 0 { info!("✅ [ALPHA-LOOKBACK] Seeding complete. Injected {} historical pools.", count); }
                 }
-                current_start = current_end + 1;
+                Err(e) => error!("❌ [ALPHA-LOOKBACK] Historical scan failed: {}", e),
             }
             info!("🏁 [PILLAR Z] Warm Start process complete.");
         });
