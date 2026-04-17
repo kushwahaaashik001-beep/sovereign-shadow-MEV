@@ -1,5 +1,5 @@
 # --- Build Stage ---
-FROM rust:1.85-slim-bookworm as builder
+FROM rust:latest as builder
 
 # Install system dependencies for compilation (needed for OpenSSL/crypto)
 RUN apt-get update && apt-get install -y \
@@ -10,6 +10,9 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 COPY . .
+
+# Pillar INFRA: Force lockfile update to sync with the latest stable toolchain and resolve version conflicts
+RUN cargo update
 
 # Build with release profile for nanosecond performance
 RUN cargo build --release
