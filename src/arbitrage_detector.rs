@@ -15,7 +15,7 @@ use dashmap::DashMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use crate::gas_feed::GasPriceFeed;
 use crate::bidding_engine::BiddingEngine;
-use crate::models::{Chain, Opportunity, DexName, Path, Hop, DexType, PoolEdge};
+use crate::models::{Chain, Opportunity, DexName, Path, Hop, DexType, PoolEdge, MempoolTx};
 use crate::state_mirror::StateMirror;
 use crate::constants;
 use crate::factory_scanner::NewPoolEvent;
@@ -155,8 +155,13 @@ impl ArbitrageDetector {
                 Some(event) = self.event_rx.recv() => {
                     SWAPS_RECEIVED.fetch_add(1, Ordering::Relaxed);
                     // Pillar Z: Update pool activity to keep graph "Hot"
-                    if let Some(pool) = self.get_pool_from_router(&event.swap_info.router, &event.swap_info.token_in, &event.swap_info.token_out) {
-                        self.pool_activity.insert(pool, std::time::Instant::now());
+                    if event.swap_info.token_in.is_zero() {
+                        // Event-based trigger (Back-running)
+                        self.pool_activity.insert(event.swap_info.router, std::time::Instant::now());
+                    } else {
+                        if let Some(pool) = self.get_pool_from_router(&event.swap_info.router, &event.swap_info.token_in, &event.swap_info.token_out) {
+                            self.pool_activity.insert(pool, std::time::Instant::now());
+                        }
                     }
                     self.process_event(event, math).await;
                 }
@@ -196,22 +201,34 @@ impl ArbitrageDetector {
             FxHashMap::default()
         };
 
-        let start_token_idx = match graph.token_to_idx.get(&event.swap_info.token_in) {
-            Some(idx) => *idx,
-            None => return,
-        };
-        let current_token_idx = match graph.token_to_idx.get(&event.swap_info.token_out) {
-            Some(idx) => *idx,
-            None => return,
-        };
+        // Pillar C: Multi-Directional Back-running Search (In-Memory Math)
+        let mut search_directions = Vec::new();
 
-        let start_idx = graph.nodes[current_token_idx as usize] as usize;
-        let end_idx = graph.nodes[current_token_idx as usize + 1] as usize;
+        if event.swap_info.token_in.is_zero() {
+            // Back-running trigger: Evaluate both directions of the pool using RAM state
+            if let Some(reg) = self.pool_registry.get(&event.swap_info.router) {
+                search_directions.push((reg.0, reg.1));
+                search_directions.push((reg.1, reg.0));
+            }
+        } else {
+            // Front-running trigger: Evaluate specific swap direction
+            search_directions.push((event.swap_info.token_in, event.swap_info.token_out));
+        }
 
-        // Pillar C: Parallel Graph Traversal
-        // Instead of a single deep recursion, we parallelize the first layer of exploration.
-        // This utilizes all CPU cores for simultaneous 3-hop, 4-hop, and 5-hop cycle detection.
-        for i in start_idx..end_idx {
+        for (t_in, t_out) in search_directions {
+            let start_token_idx = match graph.token_to_idx.get(&t_in) {
+                Some(idx) => *idx,
+                None => continue,
+            };
+            let current_token_idx = match graph.token_to_idx.get(&t_out) {
+                Some(idx) => *idx,
+                None => continue,
+            };
+
+            let start_idx = graph.nodes[current_token_idx as usize] as usize;
+            let end_idx = graph.nodes[current_token_idx as usize + 1] as usize;
+
+            for i in start_idx..end_idx {
             let edge = graph.edges[i].clone();
             let graph_c = graph.clone();
             let state_mirror_c = state_mirror.clone();
@@ -289,7 +306,9 @@ impl ArbitrageDetector {
                         }
                     }
                     if fetched_states.len() != hops.len() { continue; }
-
+                    
+                    // RAM MATH: All path calculations happen here in microseconds
+                    // No RPC calls are made during optimal input discovery
                     let path = Arc::new(Path::new(&hops, 200_000));
                     let start_token = hops[0].token_in;
                     let contains_aerodrome = hops.iter().any(|h| h.dex_name == DexName::Aerodrome);
@@ -328,13 +347,14 @@ impl ArbitrageDetector {
                         let opp = Opportunity {
                             id: format!("cycle-{}", CYCLES_FOUND.load(Ordering::Relaxed)),
                             path, expected_profit: profit, input_token: start_token, input_amount: optimal_in,
-                            pending_txs: event_c.mempool_tx.as_ref().map(|m| vec![m.clone()]).unwrap_or_default(),
+                            pending_txs: event_c.mempool_tx.as_ref().map(|m: &MempoolTx| vec![m.clone()]).unwrap_or_default(),
                             chain: config_c.chain, trigger_sender: Some(event_c.sender), ..Default::default()
                         };
                         let _ = opp_tx_c.send(opp);
                     }
                 }
             });
+            }
         }
     }
 

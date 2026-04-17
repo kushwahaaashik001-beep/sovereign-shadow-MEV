@@ -1,10 +1,8 @@
 #![allow(dead_code)]
-use alloy_primitives::{Address, B256, U256};
-use alloy::rpc::types::Transaction as AlloyTransaction;
+use alloy_primitives::{Address, B256, U256, fixed_bytes};
+use alloy::rpc::types::{Log, Filter};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
-use crate::models::{Chain, SwapInfo, PoolKey, MempoolTx};
-use crate::universal_decoder::{UniversalDecoder, DecodeTx};
-use crate::constants::TARGET_ROUTERS;
+use crate::models::{Chain, SwapInfo, PoolKey, DexName, MempoolTx};
 use futures_util::stream::StreamExt;
 use dashmap::DashSet;
 use rustc_hash::FxHasher;
@@ -99,31 +97,51 @@ impl MempoolListener {
     }
 
     pub async fn run(self) -> Result<(), ListenerError> {
-        info!("📡 [Pillar A] Private WSS Streaming Active (Blast/Ankr Optimized)");
+        info!("📡 [BLOCK-WATCH] Disabling Mempool Snipe. Shifting to Event-Based Architecture (Zero Rate Limit)");
+        info!("🥷 Mode: Back-running (Post-Swap Arbitrage)");
         
-        let decoder = Arc::new(UniversalDecoder::new());
-        let seen_hashes = self.seen_hashes.clone();
         let mut tasks = Vec::new();
 
-        // Pillar A: Multi-WSS Scavenging Orchestration
-        // Connect to ALL provided endpoints in parallel to bypass rate limits and win the latency race.
         for endpoint in &self.config.endpoints {
             let endpoint = endpoint.clone();
             let event_tx = self.event_tx.clone();
-            let decoder_inner = decoder.clone();
-            let config = self.config.clone();
-            let seen_hashes_ws = seen_hashes.clone();
+            let seen_hashes_ws = self.seen_hashes.clone();
 
             tasks.push(tokio::spawn(async move {
                 loop {
                     let ws = WsConnect::new(endpoint.clone());
                     match ProviderBuilder::new().on_ws(ws).await {
                         Ok(provider) => {
-                            info!("✅ [SENTRY] Connected to WSS Feed: {}", endpoint);
-                            if let Ok(sub) = provider.subscribe_full_pending_transactions().await {
-                                let mut stream = sub.into_stream();
-                                while let Some(tx) = stream.next().await {
-                                    Self::process_raw_tx(&tx, &decoder_inner, &event_tx, &config, &seen_hashes_ws);
+                            info!("✅ [EVENT-WATCH] Connected to WSS: {}", endpoint);
+                            
+                            // 1. Subscribe to New Blocks (Back-running pulse)
+                            let block_sub = provider.subscribe_blocks().await;
+                            
+                            // 2. Subscribe to Sync Events (Uniswap V2 / Aerodrome / BaseSwap)
+                            // Topic: Sync(uint112 reserve0, uint112 reserve1)
+                            let v2_sync = fixed_bytes!("1c411e9a96e071241c2f21f7726b17ae89e3ad05159d3f1a05103a5413173d0a");
+                            // V3 Swap Topic: Swap(address,address,int256,int256,uint160,uint128,int24)
+                            let v3_swap = fixed_bytes!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
+                            
+                            let filter = Filter::new().event_signature(vec![v2_sync, v3_swap]);
+                            let log_sub = provider.subscribe_logs(&filter).await;
+
+                            if let (Ok(blocks), Ok(logs)) = (block_sub, log_sub) {
+                                let mut block_stream = blocks.into_stream();
+                                let mut log_stream = logs.into_stream();
+
+                                loop {
+                                    tokio::select! {
+                                        Some(block) = block_stream.next() => {
+                                            info!("📦 [NEW BLOCK] #{} | Analyzing for back-run gaps...", 
+                                                block.header.number);
+                                        }
+                                        Some(log) = log_stream.next() => {
+                                            // Treat Sync events as immediate triggers
+                                            Self::process_log_event(&log, &event_tx, &seen_hashes_ws);
+                                        }
+                                        else => break,
+                                    }
                                 }
                             }
                         }
@@ -142,64 +160,44 @@ impl MempoolListener {
         Ok(())
     }
 
-    #[inline(always)]
-    fn process_raw_tx(
-        tx: &AlloyTransaction,
-        decoder: &UniversalDecoder,
+    fn process_log_event(
+        log: &Log,
         event_tx: &UnboundedSender<SwapEvent>,
-        config: &MempoolListenerConfig,
         seen_hashes: &DashSet<B256, BuildHasherDefault<FxHasher>>,
     ) {
-        // 0. Deduplication Filter: Skip if already processed (P2P wins usually)
-        if !seen_hashes.insert(tx.hash) {
+        let tx_hash = match log.transaction_hash {
+            Some(h) => h,
+            None => return,
+        };
+
+        if !seen_hashes.insert(tx_hash) {
             return;
         }
         if seen_hashes.len() > 100_000 { seen_hashes.clear(); }
 
-        // 1. Zero-Cost Pre-Filter: Check if 'to' is a relevant contract
-        let to = match tx.to {
-            Some(addr) => addr,
-            None => return,
+        // Pillar Z: Back-running Trigger
+        // Hum Log address ko pool address ki tarah treat kar rahe hain. 
+        // Engine ab state_mirror se latest reserves uthayega bina kisi extra RPC request ke.
+        let event = SwapEvent {
+            tx_hash,
+            sender: Address::ZERO, 
+            swap_info: SwapInfo {
+                dex: DexName::UniswapV2, // Engine will resolve actual DEX from pool address
+                router: log.address(),    // Using log address as the trigger pool
+                token_in: Address::ZERO,
+                token_out: Address::ZERO,
+                amount_in: U256::ZERO,
+                amount_out_min: U256::ZERO,
+                to: Address::ZERO,
+                fee: None,
+                permit2_nonce: None,
+            },
+            effective_gas_price: U256::ZERO,
+            received_at: Instant::now(),
+            is_whale_trigger: false,
+            mempool_tx: None,
         };
 
-        // Pillar Z: Autonomous Discovery - Attempt to decode even unknown routers
-        // We don't return early if it's not a known router, we let the decoder try its magic.
-        let is_known = TARGET_ROUTERS.contains(&to) || config.tracked_pools.contains(&PoolKey { pool: to });
-
-        // 2. Efficient Data Conversion
-        // Converting alloy_primitives::Bytes to bytes::Bytes (ref-counted)
-        let input_ref = bytes::Bytes::from(tx.input.0.clone());
-
-        let decode_tx = DecodeTx {
-            to: Some(to),
-            value: tx.value,
-            input: input_ref,
-        };
-
-        let swaps = decoder.decode(&decode_tx);
-        if swaps.is_empty() && !is_known { return; } // Drop if unknown and not a swap
-
-        for swap in swaps {
-            // Signal volume detection for non-tracked pools to trigger registry promotion
-            if !is_known && swap.amount_in > U256::from(5 * 10u128.pow(16)) {
-                 // This swap is on an unknown contract but has volume. High-Alpha signal.
-            }
-
-            let event = SwapEvent {
-                tx_hash: tx.hash,
-                sender: tx.from,
-                swap_info: swap,
-                effective_gas_price: U256::from(tx.gas_price.unwrap_or_default()),
-                received_at: Instant::now(),
-                is_whale_trigger: tx.value > U256::from(10u128.pow(18)), // 1 ETH trigger
-                mempool_tx: Some(MempoolTx {
-                    data: tx.input.clone(),
-                    hash: tx.hash,
-                    to: tx.to,
-                }),
-            };
-            // Send to detector channel
-            let _ = event_tx.send(event);
-        }
+        let _ = event_tx.send(event);
     }
 }
