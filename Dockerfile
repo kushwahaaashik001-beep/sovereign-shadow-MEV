@@ -1,5 +1,5 @@
 # --- Build Stage ---
-FROM rust:1.78-slim-bookworm as builder
+FROM rust:1.85-slim-bookworm as builder
 
 # Install system dependencies for compilation (needed for OpenSSL/crypto)
 RUN apt-get update && apt-get install -y \
