@@ -42,6 +42,7 @@ pub struct FlashLoanExecutor {
     bidding_engine:       Arc<BiddingEngine>,
     l1_calc:              Arc<L1DataFeeCalculator>,
     pub occupied_pools:   Arc<DashMap<(u64, Address), String>>, // Pillar SEQ: (Block, Pool) -> OppID
+    pub http_pool:        Option<Arc<crate::WsProviderPool>>,  // Pillar L: High-speed validation pool
     vetted_tokens:        Arc<DashMap<Address, bool>>,         // Speed: Skip honeypot for known safe tokens
 }
 
@@ -57,6 +58,7 @@ impl FlashLoanExecutor {
         state_simulator:  Arc<StateSimulator>,
         bidding_engine:   Arc<BiddingEngine>,
         l1_calc:          Arc<L1DataFeeCalculator>,
+        http_pool:        Option<Arc<crate::WsProviderPool>>,
     ) -> Result<Self, MEVError> {
         let chain_id = provider.get_chain_id().await.map_err(|e| MEVError::Other(e.to_string()))?;
         let chain = Chain::try_from_id(chain_id).unwrap_or(Chain::Base);
@@ -65,6 +67,7 @@ impl FlashLoanExecutor {
             bribe_percent, nonce_manager, circuit_breaker,
             state_simulator, bidding_engine, l1_calc,
             occupied_pools: Arc::new(DashMap::new()),
+            http_pool,
             vetted_tokens: Arc::new(DashMap::new()),
         })
     }
@@ -108,10 +111,12 @@ impl FlashLoanExecutor {
 
         // Pillar L: Ensure bytecode is cached and scanned for honeypot patterns before simulation.
         // Static analysis must happen before dynamic simulation for 100% coverage.
+        // HTTP pool ka use karke rapid fire honeypot checks kar rahe hain.
         let mut fetch_tasks = Vec::with_capacity(opp.path.hops.len() * 2);
+        let fetch_provider = self.http_pool.as_ref().map(|p| p.next()).unwrap_or_else(|| self.provider.clone());
         for hop in &opp.path.hops {
-            fetch_tasks.push(self.state_simulator.mirror.fetch_and_cache_bytecode(hop.token_out, self.provider.clone()));
-            fetch_tasks.push(self.state_simulator.mirror.fetch_and_cache_bytecode(hop.pool_address, self.provider.clone()));
+            fetch_tasks.push(self.state_simulator.mirror.fetch_and_cache_bytecode(hop.token_out, fetch_provider.clone()));
+            fetch_tasks.push(self.state_simulator.mirror.fetch_and_cache_bytecode(hop.pool_address, fetch_provider.clone()));
         }
         futures::future::join_all(fetch_tasks).await;
 

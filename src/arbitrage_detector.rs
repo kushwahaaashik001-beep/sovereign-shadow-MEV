@@ -194,8 +194,8 @@ impl ArbitrageDetector {
         let config = self.config.clone();
 
         // Alpha Hunter: Predator Filter
-        // Skip processing if the trigger pool is already congested with bots.
-        if self.state_mirror.is_congested(&event.swap_info.router, 5) {
+        // Competition low rakhne ke liye limit ko 3 kar diya hai. 
+        if self.state_mirror.is_congested(&event.swap_info.router, 3) {
             return;
         }
 

@@ -205,8 +205,11 @@ impl StateMirror {
     /// Pillar B/H: Fetch bytecode from RPC and scan for malicious patterns.
     pub async fn fetch_and_cache_bytecode<P: Provider<BoxTransport>>(&self, address: Address, provider: Arc<P>) {
         // Pillar H: Absolute Whitelist
-        // Kabhi bhi core tokens ya core pools ko malicious flag mat karo.
-        if crate::constants::CORE_TOKENS.contains(&address) || crate::constants::CORE_POOLS.contains(&address) { return; }
+        // Standard pools aur top tokens ko scan hi mat karo, ye 100% safe hain.
+        if crate::constants::CORE_TOKENS.contains(&address) || 
+           crate::constants::CORE_POOLS.contains(&address) ||
+           crate::constants::TOP_100_POOLS.contains(&address) ||
+           self.pools.contains_key(&address) { return; }
         
         if self.bytecodes.contains_key(&address) || self.is_poisoned(&address) { return; }
 

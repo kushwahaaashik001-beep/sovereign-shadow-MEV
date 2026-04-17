@@ -258,6 +258,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
         state_simulator.clone(),
         bidding_engine.clone(),
         l1_calc.clone(),
+        Some(http_provider_pool.clone()),
     ).await?);
 
     // Pillar E: Real-time Block Tracker & State Mirror Sync (Heartbeat)
@@ -430,7 +431,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
 
     // Pillar Z: Proactive Pool Initialization Task
     let mirror_init = state_mirror.clone();
-    let provider_init = ws_provider.clone();
+    let http_pool_init = http_provider_pool.clone();
     tokio::spawn(async move {
         while let Ok(event) = pool_rx.recv().await {
                 let (pool_addr, dex_type) = match event {
@@ -451,8 +452,9 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
                 });
 
             // Pillar L: Proactive Bytecode Warming for X-Ray Scanning
+            // HTTP pool ka use karke WebSocket connections aur rate limits bacha rahe hain.
             let m = mirror_init.clone();
-            let p = provider_init.clone();
+            let p = http_pool_init.next();
             tokio::spawn(async move {
                 m.fetch_and_cache_bytecode(pool_addr, p).await;
             });
