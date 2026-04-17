@@ -8,12 +8,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, error};
+use dashmap::DashSet;
+use rustc_hash::FxHasher;
+use std::hash::BuildHasherDefault;
 
 use crate::models::{Chain, MEVError, TOKEN_WETH};
 use crate::gas_feed::GasPriceFeed;
 use crate::utils::{CircuitBreaker, L1DataFeeCalculator};
 use crate::nonce_manager::NonceManager;
-use crate::constants::{MIN_SEARCHER_BALANCE_WEI, DUST_THRESHOLD_WEI, BASE_AERODROME_ROUTER, MAX_SWEEP_GAS_PRICE_WEI};
+use crate::constants::{MIN_SEARCHER_BALANCE_WEI, DUST_THRESHOLD_WEI, BASE_AERODROME_ROUTER, MAX_SWEEP_GAS_PRICE_WEI, SAFE_TOKENS};
 
 sol! {
     #[sol(rpc)]
@@ -59,6 +62,7 @@ pub struct InventoryManager {
     #[allow(dead_code)]
     l1_calc:         Arc<L1DataFeeCalculator>,
     running:         AtomicBool,
+    harvest_registry: Arc<DashSet<Address, BuildHasherDefault<FxHasher>>>,
 }
 
 impl InventoryManager {
@@ -72,7 +76,16 @@ impl InventoryManager {
         gas_feed:        Arc<GasPriceFeed>,
         l1_calc:         Arc<L1DataFeeCalculator>,
     ) -> Self {
-        Self { provider, wallet, executor_address, chain, circuit_breaker, nonce_manager, gas_feed, l1_calc, running: AtomicBool::new(false) }
+        let harvest_registry = Arc::new(DashSet::with_hasher(BuildHasherDefault::default()));
+        
+        // Pre-seed with safe tokens
+        if let Some(tokens) = SAFE_TOKENS.get(&chain) {
+            for token in tokens {
+                harvest_registry.insert(*token);
+            }
+        }
+
+        Self { provider, wallet, executor_address, chain, circuit_breaker, nonce_manager, gas_feed, l1_calc, running: AtomicBool::new(false), harvest_registry }
     }
 
     /// Pillar Q: Bootstrap Readiness Check.
@@ -91,9 +104,23 @@ impl InventoryManager {
         Ok(())
     }
 
-    /// Pillar J: Sweep dust tokens → WETH when gas is cheap.
-    pub async fn auto_sweep(&self, tokens: Vec<Address>) -> Result<(), MEVError> {
+    /// Pillar J: Record a new token for future harvesting.
+    pub fn register_token_for_harvest(&self, token: Address) {
+        if token != TOKEN_WETH && !token.is_zero() {
+            self.harvest_registry.insert(token);
+        }
+    }
+
+    /// Pillar J: Auto-Profit-Harvesting
+    /// Sweeps all tracked meme tokens → WETH when gas is cheap.
+    pub async fn auto_sweep(&self) -> Result<(), MEVError> {
         if self.running.swap(true, Ordering::SeqCst) { return Ok(()); }
+
+        let tokens: Vec<Address> = self.harvest_registry.iter().map(|r| *r).collect();
+        if tokens.is_empty() {
+            self.running.store(false, Ordering::SeqCst);
+            return Ok(());
+        }
 
         // Gas-Aware Check: Only sweep when gas is ultra-cheap ( < 0.05 gwei)
         let (base_fee, _, _) = self.gas_feed.current().await;

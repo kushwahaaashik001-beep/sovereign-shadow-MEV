@@ -77,10 +77,7 @@ contract ShadowBot {
      * It receives the loan details and the ghost-encoded path data.
      */
     function executeArbitrage(
-        address /*loanToken*/,
-        uint256 /*loanAmount*/,
-        bytes calldata pathData,
-        uint256 /*minProfit*/
+        bytes calldata pathData
     ) external onlyOwner {
         _initiateExecution(pathData);
     }
@@ -238,28 +235,30 @@ contract ShadowBot {
         require(msg.sender == AAVE_V3_POOL, "Only Aave V3 Pool");
 
         uint256 minProfit;
-        address loanToken = assets[0];
         uint256 balanceBefore;
+        address primaryToken = assets[0];
 
         assembly {
             minProfit := calldataload(params.offset)
             
             mstore(0x00, 0x70a08231) // balanceOf(address)
             mstore(0x04, address())
-            if iszero(staticcall(gas(), loanToken, 0x00, 0x24, 0x20, 0x20)) { revert(0, 0) }
-            balanceBefore := sub(mload(0x20), calldataload(amounts.offset))
+            if iszero(staticcall(gas(), primaryToken, 0x00, 0x24, 0x20, 0x20)) { revert(0, 0) }
+            balanceBefore := sub(mload(0x20), mload(add(amounts.offset, 0x20)))
         }
 
         // Pillar N: Avoid Calldata-to-Memory Copy
         _executeArbitrageHopsCalldata(params); 
 
-        // Aave Repayment: Principal + Premium (Fee) via safeApprove
-        _safeApprove(loanToken, AAVE_V3_POOL, amounts[0] + premiums[0]);
+        // Pillar M: Multi-Asset Repayment Loop
+        for (uint256 i = 0; i < assets.length; i++) {
+            _safeApprove(assets[i], AAVE_V3_POOL, amounts[i] + premiums[i]);
+        }
 
         assembly {
             mstore(0x00, 0x70a08231)
             mstore(0x04, address())
-            if iszero(staticcall(gas(), loanToken, 0x00, 0x24, 0x20, 0x20)) { revert(0, 0) }
+            if iszero(staticcall(gas(), primaryToken, 0x00, 0x24, 0x20, 0x20)) { revert(0, 0) }
             let balanceAfter := mload(0x20)
             
             if lt(balanceAfter, add(balanceBefore, minProfit)) {

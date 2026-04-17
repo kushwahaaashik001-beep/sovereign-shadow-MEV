@@ -13,12 +13,6 @@ pub const ENV_HTTP_URL: &str = "SHADOW_HTTP_URL";
 pub const ENV_PRIVATE_KEY: &str = "SHADOW_PRIVATE_KEY";
 pub const ENV_FLASHBOTS_RELAY: &str = "SHADOW_FLASHBOTS_RELAY";
 
-pub const P2P_MAX_PEERS: usize = 50;
-pub const P2P_BLOCK_PROPAGATION_THRESHOLD_MS: u64 = 50;
-pub static BASE_SENTRY_NODES: Lazy<Vec<&'static str>> = Lazy::new(|| vec![]);
-pub const P2P_MAX_PENDING_TX_CACHE: usize = 10_000;
-pub const P2P_DIAL_TIMEOUT_SEC: u64 = 5;
-
 pub const ENV_GAS_VAULT_ADDRESS: &str = "SHADOW_GAS_VAULT";
 pub const ENV_EXECUTOR_ADDRESS: &str = "SHADOW_EXECUTOR_ADDRESS";
 
@@ -43,6 +37,43 @@ pub const POOL_UNIV2_USDC_DEGEN:    Address = addr!("4b0Aaf3EBb163dd45F663b38b6d
 pub const POOL_SUSHI_WETH_DEGEN:    Address = addr!("c9034c3E7242654fd148e934814510d0e9436db4");
 pub const POOL_AERO_WETH_USDC:      Address = addr!("cDAC0d6c6C59727a65F871236188350531885C43");
 pub const POOL_AERO_WETH_AERO:      Address = addr!("7f670f78B17dEC44d5Ef68a48740b6f8849cc2e6");
+pub const POOL_AERO_WETH_BRETT:     Address = addr!("532f27101965dd16442E59d40670Fa5ad5f3fe91");
+
+pub const MOONWELL_COMPTROLLER:     Address = addr!("BBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb");
+pub const MIN_NET_PROFIT_USD_WEI:   u128 = 150_000_000_000_000; // Lowered to $0.35 to capture high-volume micro-swaps
+
+pub const POOL_HOTNESS_TTL_SEC: u64 = 1800; // 30 minutes for Autonomous Discovery
+
+/// Pillar Z: Hardcoded Top 100 Pools on Base to save RAM
+/// Optimization: Targeting "Alpha Clusters" (Meme & Ecosystem tokens) with lower competition.
+pub static TOP_100_POOLS: Lazy<FxHashSet<Address>> = Lazy::new(|| {
+    let mut set = FxHashSet::default();
+    // 1. Core Bridges (Zaruri hain rasta banaye rakhne ke liye)
+    set.insert(addr!("0xcDAC0d6c6C59727a65F871236188350531885C43")); // Aero WETH/USDC
+    set.insert(addr!("0xd0b53D9277642d899DF5C87A3966A349A798F224")); // UniV3 WETH/USDC (0.05%)
+    
+    // 2. Alpha Cluster: DEGEN (Base ka king meme)
+    set.insert(addr!("0xc9034c3E7242654fd148e934814510d0e9436db4")); // UniV2 WETH/DEGEN
+    set.insert(addr!("0x4b0Aaf3EBb163dd45F663b38b6d93f6093EBC2d3")); // UniV2 USDC/DEGEN
+    set.insert(addr!("0x3062ad446da2cfdb10266e06bee30f33ba2a6b41")); // Aero DEGEN/WETH
+
+    // 3. Alpha Cluster: AERO & Ecosystem
+    set.insert(addr!("0x7f670f78B17dEC44d5Ef68a48740b6f8849cc2e6")); // Aero WETH/AERO
+    set.insert(addr!("0x532f27101965dd16442E59d40670Fa5ad5f3fe91")); // Aero WETH/BRETT
+    set.insert(addr!("0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22")); // cbETH/WETH (Price lags often)
+
+    // 4. Alpha Cluster: Mid-Cap Memes (Low competition, High arb potential)
+    set.insert(addr!("0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865")); // Pancake WETH/MemeX
+    set.insert(addr!("0xFDa619b6d20975be8074d3315450bbBA58456B12")); // BaseSwap WETH/Virtual
+    
+    // 5. Alpha Cluster: The Scavenger Network (Targeting $20-$30/day)
+    set.insert(addr!("0x04C9F118A4864700721A163744021d21DB27c11f")); // SwapBased Meme Pair
+    set.insert(addr!("0x3D2d7681335A74Be482D207137f814bA688849E8")); // AlienBase Gaming Token
+    set.insert(addr!("0x532f27101965dd16442E59d40670Fa5ad5f3fe91")); // Brett Alpha Pair
+    set.insert(addr!("0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed")); // Degen Ecosystem Bridge
+
+    set
+});
 
 pub const SELECTOR_UNISWAP_V2_SWAP_EXACT_TOKENS_FOR_TOKENS: Selector = Selector([0x38, 0xed, 0x17, 0x39]);
 pub const SELECTOR_UNISWAP_V2_SWAP_TOKENS_FOR_EXACT_TOKENS: Selector = Selector([0x88, 0x03, 0xdb, 0xee]);
@@ -83,7 +114,7 @@ pub const AAVE_V3_POOL:   Address = addr!("A238Dd80C259a72e81d7e4664a9801593F98d
 pub const MAX_TICK_CROSSES: usize = 256;
 pub const SIMULATION_GAS_LIMIT: u64 = 600_000;
 pub const SIMULATION_VERBOSE: bool = false;
-pub const MAX_HOPS: usize = 4;
+pub const MAX_HOPS: usize = 5; // Multi-hop logic ke liye depth badha di gayi hai
 pub const TOP_N_TOKENS: usize = 50;
 pub const PATH_CACHE_TTL_MS: u64 = 5000;
 pub const GSS_TOLERANCE_WEI: u128 = 1_000_000_000_000;
@@ -93,9 +124,10 @@ pub const POOL_REPLACEMENT_INTERVAL_SEC: u64 = 300;
 pub const FLASHBOTS_RELAY:  &str = "https://relay.flashbots.net";
 pub const BEAVERBUILD_RELAY:&str = "https://rpc.beaverbuild.org/";
 pub const TITAN_RELAY:      &str = "https://rpc.titanbuilder.xyz/";
+pub const ALUMNI_RELAY:     &str = "https://base.flashbots.net"; // Flashbots Base endpoint
 
 pub static PRIVATE_RELAYS: Lazy<Vec<&'static str>> = Lazy::new(|| {
-    vec![FLASHBOTS_RELAY, BEAVERBUILD_RELAY, TITAN_RELAY, PENGUIN_RELAY, RSYNC_RELAY]
+    vec![ALUMNI_RELAY, BEAVERBUILD_RELAY, TITAN_RELAY, PENGUIN_RELAY, RSYNC_RELAY]
 });
 
 pub const PENGUIN_RELAY:    &str = "https://rpc.penguinbuild.org";
@@ -141,37 +173,26 @@ pub const MAX_ALLOWED_TAX_BPS: u64 = 300;
 pub const MIN_LIQUIDITY_ETH: u128 = 1_000_000_000_000_000_000;
 
 pub const REQUIRE_SUCCESSFUL_SIMULATION: bool = true;
+pub const ALPHA_SCAN_DEPTH: usize = 5; // Deep paths for complex obscure cycles
 
 pub const OPTIMISM_GAS_ORACLE:    Address = addr!("420000000000000000000000000000000000000F");
 pub const ARBITRUM_NODE_INTERFACE:Address = addr!("00000000000000000000000000000000000000C8");
 
 pub static L1_BASE_FEE_SCALAR: Lazy<FxHashMap<Chain, u64>> = Lazy::new(|| {
     let mut m = FxHashMap::default();
-    m.insert(Chain::Optimism, 1360);
     m.insert(Chain::Base, 1360);
-    m.insert(Chain::Arbitrum, 1000);
-    m.insert(Chain::Polygon, 0);
-    m.insert(Chain::Mainnet, 0);
     m
 });
 
 pub static L2_L1_DATA_GAS_MULTIPLIER: Lazy<FxHashMap<Chain, f64>> = Lazy::new(|| {
     let mut m = FxHashMap::default();
-    m.insert(Chain::Arbitrum, 0.1);
-    m.insert(Chain::Optimism, 0.2);
     m.insert(Chain::Base, 0.2);
-    m.insert(Chain::Polygon, 0.0);
-    m.insert(Chain::Mainnet, 0.0);
     m
 });
 
 pub static L2_GAS_LIMIT_MULTIPLIER: Lazy<FxHashMap<Chain, f64>> = Lazy::new(|| {
     let mut m = FxHashMap::default();
-    m.insert(Chain::Arbitrum, 1.5);
-    m.insert(Chain::Optimism, 1.5);
     m.insert(Chain::Base, 1.5);
-    m.insert(Chain::Polygon, 1.2);
-    m.insert(Chain::Mainnet, 1.0);
     m
 });
 
@@ -262,14 +283,13 @@ pub const BASE_BASESWAP_FACTORY:    Address = addr!("FDa619b6d20975be8074d331545
 pub const BASE_BASESWAP_ROUTER:     Address = addr!("327Df1E4de51d9752a3e019c42e5f9BB762ed144");
 pub const BASE_MAVERICK_FACTORY:    Address = addr!("3708D64936496924f2b1853B0287515089304386");
 pub const BASE_MAVERICK_ROUTER:     Address = addr!("792376e191C802a466D57b545f8f85f340807551");
+pub const BASE_UNISWAP_V3_ROUTER_SR2: Address = addr!("262136065839E9905E990867056E137f866A4839");
 
-pub const TARGET_ROUTERS: [Address; 6] = [
-    BASE_SUSHISWAP_ROUTER,
-    BASE_PANCAKESWAP_ROUTER,
-    BASE_BASESWAP_ROUTER,
-    BASE_MAVERICK_ROUTER,
+pub const TARGET_ROUTERS: [Address; 4] = [
     BASE_AERODROME_ROUTER,
     BASE_UNISWAP_V3_ROUTER,
+    BASE_UNISWAP_V3_ROUTER_SR2,
+    MOONWELL_COMPTROLLER,
 ];
 
 #[derive(Debug, Clone)]
@@ -291,10 +311,6 @@ pub static SAFE_TOKENS: Lazy<FxHashMap<Chain, Vec<Address>>> = Lazy::new(|| {
         addr!("50c5725949A6F0c72E6C4a641F24049A917DB0Cb"),
         addr!("940181a94A35A4569E4529A3CDfB74e38FD98631"),
         addr!("4ed4E862860beD51a9570b96d89aF5E1B0Efefed"),
-    ]);
-    m.insert(Chain::Mainnet, vec![
-        addr!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
-        addr!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
     ]);
     m
 });
@@ -318,7 +334,6 @@ pub static CORE_POOLS: Lazy<FxHashSet<Address>> = Lazy::new(|| {
 
 pub static BLACKLISTED_TOKENS: Lazy<FxHashMap<Chain, FxHashSet<Address>>> = Lazy::new(|| {
     let mut m = FxHashMap::default();
-    m.insert(Chain::Mainnet, FxHashSet::default());
     m.insert(Chain::Base, FxHashSet::default());
     m
 });

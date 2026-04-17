@@ -92,12 +92,13 @@ impl BundleBuilder {
         let payload = json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "eth_sendBundle",
+            "method": "mev_sendBundle", // Target MEV-Blocker specific method
             "params": [{
                 "txs": txs_hex,
                 "blockNumber": format!("0x{:x}", bundle.target_block),
-                "minTimestamp": 0,
-                "maxTimestamp": 0,
+                "privacy": {
+                    "hints": ["calldata", "logs", "default_logs", "hash"]
+                }
             }]
         });
 

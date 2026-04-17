@@ -150,16 +150,8 @@ impl L1DataFeeCalculator {
     }
 
     /// Pillar J: Refresh scalars from Oracle contract every 5 mins to save RPC calls.
-    pub async fn refresh_scalars(&self, chain: crate::models::Chain) -> Result<(), MEVError> {
-        if chain == crate::models::Chain::Arbitrum {
-            let node_interface = INodeInterface::INodeInterfaceInstance::new(crate::constants::ARBITRUM_NODE_INTERFACE, self.provider.clone());
-            if let Ok(res) = node_interface.gasEstimateL1Component(Address::ZERO, false, Vec::new().into()).call().await {
-                let mut sc = (**self.scalars.load()).clone();
-                sc.l1_base_fee = res.l1BaseFee;
-                sc.last_updated = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                self.scalars.store(Arc::new(sc));
-            }
-        } else {
+    pub async fn refresh_scalars(&self, _chain: crate::models::Chain) -> Result<(), MEVError> {
+        {
             let oracle = IGasPriceOracle::IGasPriceOracleInstance::new(crate::constants::OPTIMISM_GAS_ORACLE, self.provider.clone());
             let base_scalar = oracle.baseFeeScalar().call().await.map(|r| r._0).unwrap_or(0);
             let blob_scalar = oracle.blobBaseFeeScalar().call().await.map(|r| r._0).unwrap_or(0);
@@ -180,15 +172,8 @@ impl L1DataFeeCalculator {
     }
 
     pub async fn estimate_l1_fee(&self, chain: crate::models::Chain, tx_data: &[u8]) -> Result<U256, MEVError> {
-        if !matches!(chain, crate::models::Chain::Base | crate::models::Chain::Optimism | crate::models::Chain::Arbitrum) {
+        if !matches!(chain, crate::models::Chain::Base) {
             return Ok(U256::ZERO);
-        }
-
-        if chain == crate::models::Chain::Arbitrum {
-            let node_interface = INodeInterface::INodeInterfaceInstance::new(crate::constants::ARBITRUM_NODE_INTERFACE, self.provider.clone());
-            if let Ok(res) = node_interface.gasEstimateL1Component(Address::ZERO, false, tx_data.to_vec().into()).call().await {
-                return Ok(U256::from(res.gasEstimateForL1) * res.l1BaseFee);
-            }
         }
 
         let sc = self.scalars.load();
@@ -211,7 +196,7 @@ impl L1DataFeeCalculator {
         let total_l1_gas_price = scaled_base + scaled_blob;
         
         // Pillar J: Precision Ecotone Divisor
-        let dec_val = sc.decimals.to::<u64>(); // Convert to u64 for U256::pow
+        let dec_val = sc.decimals.to::<u64>().min(18); // Safety cap for power function
         let divisor = U256::from(16) * U256::from(10u128.pow(dec_val as u32));
         
         if divisor.is_zero() { return Ok(U256::ZERO); }

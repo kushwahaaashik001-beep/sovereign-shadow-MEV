@@ -125,7 +125,21 @@ impl StateSimulator {
 
         // Pillar R: Extract simulated results
         let result = evm.transact().map_err(|e| MEVError::SimulationFailed(e.to_string()))?;
-        let access_list = alloy::rpc::types::AccessList::default(); // Placeholder: REVM requires a separate tracer for AL generation
+        
+        // Pillar AL: Dynamic Access List Generation from REVM State
+        // Converting REVM touched accounts into Alloy AccessList to lower gas and guarantee inclusion.
+        let mut access_list = alloy::rpc::types::AccessList::default();
+        for (address, account) in &result.state {
+            // Ignore common contracts to keep AL compact
+            if *address == Address::ZERO || *address == caller_eoa { continue; }
+            
+            let storage_keys: Vec<alloy_primitives::B256> = account.storage
+                .keys()
+                .map(|k| alloy_primitives::B256::from(k.to_be_bytes::<32>()))
+                .collect();
+                
+            access_list.0.push(alloy::rpc::types::AccessListItem { address: *address, storage_keys });
+        }
         
         // Commit state manually after extracting info
         evm.context.evm.db.commit(result.state);
@@ -146,7 +160,7 @@ impl StateSimulator {
             gas_used,
             branch,
             success,
-            access_list: access_list.into(), // Convert to alloy-compatible AccessList
+            access_list,
         })
     }
 
@@ -167,16 +181,19 @@ impl StateSimulator {
     }
 
     /// Pillar L: Poison Token Filter - Dynamic Honeypot & Tax Detection.
-    pub fn check_honeypot(
-        &self,
-        token: Address,
-        pool: Address,
-        amount_in_wei: U256,
-    ) -> Result<u64, MEVError> {
-        // Pillar L: Poison Token Filter
+    /// Pillar L: Advanced "is_sellable" check - Dynamic Honeypot & Tax Detection.
+    /// REVM simulation ensures that we can always exit the position back into WETH/USDC.
+    pub fn check_honeypot(&self, token: Address, pool: Address, amount_in_wei: U256) -> Result<u64, MEVError> {
+        // Skip check for safe core tokens (WETH, USDC, etc.) to optimize gas and latency
+        if crate::constants::CORE_TOKENS.contains(&token) { return Ok(0); }
+
         if self.mirror.is_poisoned(&token) || self.mirror.is_poisoned(&pool) {
             return Err(MEVError::HoneypotDetected("Static analysis flagged this pool/token".into()));
         }
+
+        // Pillar X: X-Ray Opcode Scan
+        // Hum bytecode ko binary level par scan kar rahe hain un patterns ke liye jo scam define karte hain.
+        self.xray_scan_bytecode(token)?;
 
         // 1. Manual Blacklist Check
         if let Some(blacklist) = crate::constants::BLACKLISTED_TOKENS.get(&crate::models::Chain::Base) {
@@ -199,46 +216,33 @@ impl StateSimulator {
 
         let mut evm = Evm::builder().with_db(cache_db).build();
 
-        // Step 1: "Buy" tokens by transferring from pool (simulates buy phase)
-        let mut buy_data = vec![0xa9, 0x05, 0x9c, 0xbb]; // transfer(address,uint256)
-        buy_data.extend_from_slice(&[0u8; 12]);
-        buy_data.extend_from_slice(sim_executor.as_slice());
+        // Pillar L: Sellability Test Protocol
+        // Step 1: Buy Tokens (Simulate Pool -> EOA)
         let mut amt_bytes = [0u8; 32];
         amount_in_wei.to_be_bytes::<32>().copy_from_slice(&mut amt_bytes);
-        buy_data.extend_from_slice(&amt_bytes);
 
-        evm.context.evm.env.tx = TxEnv {
-            caller: pool,
-            transact_to: TransactTo::Call(token),
-            data: Bytes::from(buy_data),
-            ..Default::default()
-        };
-        
-        let buy_res = evm.transact_commit().map_err(|e| MEVError::SimulationFailed(format!("BUY_EXEC_ERROR: {}", e)))?;
+        let buy_res = self.simulate_transfer(&mut evm, token, pool, sim_executor, amount_in_wei)?;
         if !buy_res.is_success() {
-             return Err(MEVError::HoneypotDetected("BUY_FAILED: Restricted token distribution".into()));
+            return Err(MEVError::HoneypotDetected("BUY_FAILED: Token cannot be moved from pool".into()));
         }
 
-        // Step 1.1: Verification - Did we actually get the tokens?
-        let mut check_data = vec![0x70, 0xa0, 0x82, 0x31];
-        check_data.extend_from_slice(&[0u8; 12]);
-        check_data.extend_from_slice(sim_executor.as_slice());
-
-        evm.context.evm.env.tx = TxEnv {
-            caller: sim_executor,
-            transact_to: TransactTo::Call(token),
-            data: Bytes::from(check_data),
-            ..Default::default()
-        };
-        let check_res = evm.transact().map_err(|e| MEVError::SimulationFailed(e.to_string()))?.result;
-        if let ExecutionResult::Success { output, .. } = check_res {
-            let bal = U256::from_be_slice(output.data());
-            if bal.is_zero() {
-                return Err(MEVError::HoneypotDetected("GHOST_TOKEN: Transfer reported success but balance is 0".into()));
+        // Pillar L: Liquidity Depth Guardian
+        // Hum ensure kar rahe hain ki hamara trade pool ke liquidity ka 10% se zyada na ho (Price impact protection).
+        if let Some(pool_data) = self.mirror.pools.get(&pool) {
+            let pool_reserves = pool_data.reserves0.max(pool_data.reserves1);
+            if amount_in_wei > (pool_reserves / U256::from(10)) {
+                return Err(MEVError::HoneypotDetected("LIQUIDITY_DEPTH_TOO_SHALLOW: High price impact risk".into()));
             }
         }
 
-        // Step 1.2: Advance Check - Can we Approve? (Common Honeypot Vector)
+        // Step 1.1: Verification - Balance Check
+        // Hum confirm kar rahe hain ki token actual mein EOA account mein aaya ya nahi.
+        let balance_received = self.get_erc20_balance(&mut evm, token, sim_executor)?;
+        if balance_received.is_zero() {
+            return Err(MEVError::HoneypotDetected("GHOST_TOKEN: Reported success but zero balance".into()));
+        }
+
+        // Step 1.2: Approval Verification (Crucial for Router interaction)
         let mut approve_data = vec![0x09, 0x5e, 0xa7, 0xb3]; // approve(address,uint256)
         approve_data.extend_from_slice(&[0u8; 12]);
         approve_data.extend_from_slice(recipient.as_slice());
@@ -255,57 +259,84 @@ impl StateSimulator {
              return Err(MEVError::HoneypotDetected("APPROVE_FAILED: Token blocks approval logic".into()));
         }
 
-        // Step 2: "Sell" tokens & Gas Trap Detection
-        let mut sell_data = vec![0xa9, 0x05, 0x9c, 0xbb];
-        sell_data.extend_from_slice(&[0u8; 12]);
-        sell_data.extend_from_slice(recipient.as_slice());
-        sell_data.extend_from_slice(&amt_bytes);
-
-        evm.context.evm.env.tx = TxEnv {
-            caller: sim_executor,
-            transact_to: TransactTo::Call(token),
-            data: Bytes::from(sell_data),
-            ..Default::default()
-        };
-
-        let sell_res = evm.transact_commit().map_err(|e| MEVError::SimulationFailed(format!("SELL_EXEC_ERROR: {}", e)))?;
+        // Step 2: Pillar L: Sell Verification (Simulate EOA -> Pool)
+        // Hum check kar rahe hain ki token wapas pool mein ja raha hai ya nahi.
+        let base_asset_bal_before = self.get_erc20_balance(&mut evm, crate::constants::TOKEN_WETH, sim_executor)?;
+        
+        let sell_res = self.simulate_transfer(&mut evm, token, sim_executor, pool, balance_received)?;
         if !sell_res.is_success() {
-            return Err(MEVError::HoneypotDetected("SELL_FAILED: Honeypot detected (revert on transfer)".into()));
+            return Err(MEVError::HoneypotDetected("SELL_FAILED: Token cannot be sold back to pool".into()));
         }
 
-        // Gas Trap Check: Simple transfer should not exceed 200k gas
+        // Step 2.1: Actual Liquidation Check
+        // Agar sell transaction success hai par balance nahi bada, toh ye "Ghost Sell" scam hai.
+        let base_asset_bal_after = self.get_erc20_balance(&mut evm, crate::constants::TOKEN_WETH, sim_executor)?;
+        if base_asset_bal_after <= base_asset_bal_before && !balance_received.is_zero() {
+             return Err(MEVError::HoneypotDetected("LIQUIDATION_FAILED: Sell successful but no base asset received".into()));
+        }
+
+        // Gas Trap Check: High gas on transfer usually indicates a malicious hook
         if let ExecutionResult::Success { gas_used, .. } = sell_res {
-            if gas_used > 200_000 {
-                return Err(MEVError::HoneypotDetected(format!("GAS_TRAP: Abnormal gas usage ({})", gas_used)));
+            if gas_used > 150_000 {
+                return Err(MEVError::HoneypotDetected(format!("GAS_TRAP: Abnormal sell gas ({})", gas_used)));
             }
         }
 
-        // Step 3: Check recipient balance to calculate tax
-        let mut bal_data = vec![0x70, 0xa0, 0x82, 0x31];
-        bal_data.extend_from_slice(&[0u8; 12]);
-        bal_data.extend_from_slice(recipient.as_slice());
-
-        evm.context.evm.env.tx = TxEnv {
-            caller: sim_executor,
-            transact_to: TransactTo::Call(token),
-            data: Bytes::from(bal_data),
-            ..Default::default()
-        };
-
-        let bal_res = evm.transact().map_err(|e| MEVError::SimulationFailed(e.to_string()))?.result;
-        if let ExecutionResult::Success { output, .. } = bal_res {
-            let balance_received = U256::from_be_slice(output.data());
-            if balance_received < amount_in_wei {
-                let tax_bps = (amount_in_wei.saturating_sub(balance_received) * U256::from(10000)) / amount_in_wei;
-                let tax_u64 = tax_bps.to::<u64>();
-                if tax_u64 > crate::constants::MAX_ALLOWED_TAX_BPS {
-                    return Err(MEVError::HoneypotDetected(format!("HIGH_TAX: {} BPS", tax_u64)));
-                }
-                return Ok(tax_u64);
+        // Step 3: Tax Calculation (EOA -> Recipient)
+        // To accurately calculate tax without pool noise, we use a separate transfer.
+        let _ = self.simulate_transfer(&mut evm, token, pool, sim_executor, amount_in_wei)?;
+        let tax_res = self.simulate_transfer(&mut evm, token, sim_executor, recipient, amount_in_wei)?;
+        if let ExecutionResult::Success { .. } = tax_res {
+            let received = self.get_erc20_balance(&mut evm, token, recipient)?;
+            let tax_bps = (amount_in_wei.saturating_sub(received) * U256::from(10000)) / amount_in_wei.max(U256::from(1));
+            let tax_u64 = tax_bps.to::<u64>();
+            if tax_u64 > crate::constants::MAX_ALLOWED_TAX_BPS {
+                return Err(MEVError::HoneypotDetected(format!("HIGH_TAX: {} BPS detected", tax_u64)));
             }
+            return Ok(tax_u64);
         }
 
         Ok(0)
+    }
+
+    fn simulate_transfer<DB: revm::Database + revm::DatabaseCommit>(&self, evm: &mut Evm<'_, (), DB>, token: Address, from: Address, to: Address, amount: U256) -> Result<ExecutionResult, MEVError> 
+    where <DB as revm::Database>::Error: std::fmt::Debug
+    {
+        let mut data = vec![0xa9, 0x05, 0x9c, 0xbb];
+        data.extend_from_slice(&[0u8; 12]);
+        data.extend_from_slice(to.as_slice());
+        let mut amt_bytes = [0u8; 32];
+        amount.to_be_bytes::<32>().copy_from_slice(&mut amt_bytes);
+        data.extend_from_slice(&amt_bytes);
+
+        evm.context.evm.env.tx = TxEnv {
+            caller: from,
+            transact_to: TransactTo::Call(token),
+            data: Bytes::from(data),
+            ..Default::default()
+        };
+        evm.transact_commit().map_err(|e| MEVError::SimulationFailed(format!("{:?}", e)))
+    }
+
+    fn get_erc20_balance<DB: revm::Database>(&self, evm: &mut Evm<'_, (), DB>, token: Address, account: Address) -> Result<U256, MEVError> 
+    where <DB as revm::Database>::Error: std::fmt::Debug
+    {
+        let mut data = vec![0x70, 0xa0, 0x82, 0x31];
+        data.extend_from_slice(&[0u8; 12]);
+        data.extend_from_slice(account.as_slice());
+
+        evm.context.evm.env.tx = TxEnv {
+            caller: account,
+            transact_to: TransactTo::Call(token),
+            data: Bytes::from(data),
+            ..Default::default()
+        };
+        let res = evm.transact().map_err(|e| MEVError::SimulationFailed(format!("{:?}", e)))?.result;
+        if let ExecutionResult::Success { output, .. } = res {
+            Ok(U256::from_be_slice(output.data()))
+        } else {
+            Ok(U256::ZERO)
+        }
     }
 
     /// Pillar K: Inject "Stealth Noise" to simulate competing private bundles.
@@ -393,5 +424,53 @@ impl StateSimulator {
                 let _ = evm.transact_commit();
             }
         }
+    }
+
+    /// Pillar X: Ultra-Fast Opcode X-Ray Scan
+    /// Scans bytecode for malicious sequences (Hidden blacklists, balance overrides).
+    fn xray_scan_bytecode(&self, token: Address) -> Result<(), MEVError> {
+        let bytecode = match self.mirror.get_bytecode(&token) {
+            Some(b) => b,
+            None => return Ok(()), // Core tokens won't have bytecode cached/needed
+        };
+        let code = bytecode.bytes();
+
+        // Pattern 1: The "Bot Jail" (CALLER + SLOAD + REVERT)
+        // Sequence: 0x33 (CALLER) -> ... -> 0x54 (SLOAD) -> ... -> 0xfd (REVERT)
+        // Ye aksar dikhata hai ki contract check kar raha hai ki caller blacklisted hai ya nahi.
+        let mut has_caller = false;
+        let mut has_sload = false;
+
+        for i in 0..code.len() {
+            let opcode = code[i];
+            
+            // 0xff: SELFDESTRUCT - Token contracts mein iska koi kaam nahi
+            if opcode == 0xff {
+                return Err(MEVError::HoneypotDetected("XRAY: SELFDESTRUCT pattern found".into()));
+            }
+
+            // 0xf4: DELEGATECALL - Agar token contract proxy nahi hai, toh ye trap ho sakta hai
+            if opcode == 0xf4 && code.len() < 5000 {
+                 return Err(MEVError::HoneypotDetected("XRAY: Suspicious DELEGATECALL in small contract".into()));
+            }
+
+            // State machine for Sequence Detection
+            if opcode == 0x33 { has_caller = true; }
+            if has_caller && opcode == 0x54 { has_sload = true; }
+            if has_sload && (opcode == 0xfd || opcode == 0xfe) {
+                // Re-verification: Agar ye logic small/new tokens mein hai, toh 99% honeypot hai.
+                if code.len() < 4000 {
+                    return Err(MEVError::HoneypotDetected("XRAY: Hidden Blacklist/Jail pattern detected".into()));
+                }
+            }
+
+            // Pattern 2: Origin Enforcement (0x32: ORIGIN)
+            // Agar contract sirf tx.origin ko check karke transfer allow kar raha hai.
+            if opcode == 0x32 && code.len() < 3000 {
+                 return Err(MEVError::HoneypotDetected("XRAY: Origin-dependent logic trap".into()));
+            }
+        }
+
+        Ok(())
     }
 }

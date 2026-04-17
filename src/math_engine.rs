@@ -31,7 +31,6 @@ impl MathEngine {
             let state = &states[i];
             current_amount = match hop.dex_type {
                 DexType::UniswapV2 => self.get_v2_output(current_amount, state, hop.zero_for_one),
-                DexType::UniswapV3 => self.get_v3_output(current_amount, state, hop.zero_for_one),
                 DexType::Aerodrome => self.get_aerodrome_output(current_amount, state, hop.zero_for_one),
                 _ => U256::ZERO,
             };
@@ -129,7 +128,6 @@ impl MathEngine {
 
             current_amount = match hop.dex_type {
                 DexType::UniswapV2 => self.get_v2_output(current_amount, &pool_state, hop.zero_for_one),
-                DexType::UniswapV3 => self.get_v3_output(current_amount, &pool_state, hop.zero_for_one),
                 DexType::Aerodrome => self.get_aerodrome_output(current_amount, &pool_state, hop.zero_for_one),
                 _ => U256::ZERO,
             };
@@ -255,27 +253,47 @@ impl MathEngine {
         u512_to_u256_safe(numerator / denominator)
     }
 
+    /// Pillar D: Newton-Raphson / Secant Optimization
+    /// GSS ($O(\log(1/\epsilon))$ se 10x fast convergence ($O(\log(\log(1/\epsilon)))$).
+    /// Target: Find x where PathPrice(x) == 1.0 (Marginal Price is Parity).
     pub fn find_optimal_input_newton<F>(initial_guess: U256, mut price_check: F) -> U256
     where F: FnMut(U256) -> f64 {
         let mut x = initial_guess;
-        // Pillar D: Newton-Raphson Cap
-        // 50 iterations is more than enough for convergence; fixed cap protects the thread.
-        for _ in 0..50 { 
-            let current_price = price_check(x);
-            let diff = current_price - 1.0;
+        let mut last_x = x;
+        let mut last_price = price_check(x);
+
+        // Pillar D: Convergence Cap
+        // Newton usually converges in < 8 steps for DEX curves.
+        for _ in 0..12 { 
+            let price = price_check(x);
+            let error = price - 1.0; // We want price(x) = 1.0
             
-            // Convergence criteria: 0.01% price impact
-            if diff.abs() < 0.0001 || x.is_zero() { break; }
+            // Convergence criteria: 0.001% precision
+            if error.abs() < 0.00001 || x.is_zero() { break; }
             
-            // Pillar D: Dynamic Aggression
             let x_f = x.to::<u128>() as f64;
-            let step = (x_f * diff * 5.0) as i128; // Increased multiplier for faster convergence
-            
-            let next_x = if step > 0 {
-                x.saturating_add(U256::from(step as u128))
+            let last_x_f = last_x.to::<u128>() as f64;
+
+            // Estimate the derivative of the price function: g'(x) = d(Price)/dx
+            // This is actually the second derivative of the profit function.
+            let derivative = if (x_f - last_x_f).abs() < 1e-6 {
+                // Fallback: Use a tiny delta for numerical stability if x hasn't moved
+                let delta = x_f * 0.01 + 1e6;
+                let price_next = price_check(U256::from((x_f + delta) as u128));
+                (price_next - price) / delta
             } else {
-                x.saturating_sub(U256::from(step.abs() as u128))
+                (price - last_price) / (x_f - last_x_f)
             };
+
+            if derivative >= 0.0 || derivative.abs() < 1e-28 { break; } // Precision-Tuned for 18 decimals
+
+            let step = error / derivative;
+            last_x = x;
+            last_price = price;
+
+            let next_x_f = (x_f - step).max(0.0);
+            let next_x = U256::from(next_x_f as u128);
+            
             if next_x == x || next_x.is_zero() { break; }
             x = next_x;
         }
@@ -396,7 +414,7 @@ mod tests {
     #[test]
     fn test_newton_optimizer_convergence() {
         // Mock a price function: price(x) = 1.1 - (x / 10^21)
-        // Marginal price is 1.0 when x = 0.1 * 10^21 = 10^20 (100 tokens)
+        // Marginal price is 1.0 when x = 0.1 * 10^21 = 10^20 (100 tokens/ETH)
         let initial_guess = U256::from(10u128.pow(18));
         let optimal = MathEngine::find_optimal_input_newton(initial_guess, |x| {
             1.1 - (x.to::<u128>() as f64 / 1e21)
@@ -409,7 +427,7 @@ mod tests {
             U256::from(target) - optimal
         };
 
-        // Tolerance of 1%
-        assert!(diff < U256::from(10u128.pow(18)));
+        // Precision Check: Must be within 0.0001 ETH of target
+        assert!(diff < U256::from(10u128.pow(14)));
     }
 }

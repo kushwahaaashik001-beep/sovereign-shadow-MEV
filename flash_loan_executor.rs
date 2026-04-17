@@ -8,7 +8,6 @@ use alloy::transports::BoxTransport;
 use alloy_primitives::{Address, U256, B256};
 use std::sync::Arc;
 use tracing::{info, warn, error, debug};
-use dashmap::DashMap;
 
 use crate::bidding_engine::BiddingEngine;
 use crate::bundle_builder::BundleBuilder;
@@ -41,7 +40,6 @@ pub struct FlashLoanExecutor {
     state_simulator:      Arc<StateSimulator>,
     bidding_engine:       Arc<BiddingEngine>,
     l1_calc:              Arc<L1DataFeeCalculator>,
-    pub occupied_pools:   Arc<DashMap<(u64, Address), String>>, // Pillar SEQ: (Block, Pool) -> OppID
 }
 
 impl FlashLoanExecutor {
@@ -63,31 +61,13 @@ impl FlashLoanExecutor {
             provider, contract_address, min_profit_wei, chain, bundle_builder,
             bribe_percent, nonce_manager, circuit_breaker,
             state_simulator, bidding_engine, l1_calc,
-            occupied_pools: Arc::new(DashMap::new()),
         })
-    }
-
-    /// Pillar SEQ: Prune old block entries from the sequencer to save memory.
-    pub fn prune_sequencer(&self, current_block: u64) {
-        self.occupied_pools.retain(|(block, _), _| *block >= current_block);
     }
 
     /// Pillar M + N: Simulate locally then execute. Zero-Loss Shield enforced.
     pub async fn simulate_and_execute(&self, opp: &Opportunity) -> Result<B256, MEVError> {
-        let builder = self.bundle_builder.as_ref().ok_or(MEVError::Other("BundleBuilder missing".into()))?;
-        let mut target_block = builder.block_tracker.current() + 1;
-
         if self.circuit_breaker.is_open() {
             return Err(MEVError::CircuitBreakerOpen);
-        }
-
-        // Pillar SEQ: Bundle Sequencer - Collision Detection
-        for hop in &opp.path.hops {
-            if let Some(existing_opp) = self.occupied_pools.get(&(target_block, hop.pool_address)) {
-                warn!("⚠️ [SEQUENCER] Collision detected: opp={} uses pool {:?} already occupied by opp={}", 
-                    opp.id, hop.pool_address, existing_opp.value());
-                return Err(MEVError::Other("Self-collision detected".into()));
-            }
         }
 
         // Pillar T: Anti-Drift Guardian. 
@@ -192,13 +172,12 @@ impl FlashLoanExecutor {
         let bribe_pct = self.bidding_engine.calculate_bribe(opp);
         let bribe_wei = (net_profit * U256::from(bribe_pct)) / U256::from(100u64);
 
-        // Pillar N: The Revert Protection Rule
-        // ₹300 Budget Shield: Net_Profit must strictly exceed ALL costs.
+        // Hybrid Efficiency Logic: Strict check for Net_Profit > Gas_Cost + Bribe
         let execution_cost = adjusted_total_cost + bribe_wei;
         if top_sim.profit <= execution_cost {
-            let msg = format!("PROTECTION: Profit {} <= Total Cost {} (L1+L2+Bribe). Dropping to save gas budget.", top_sim.profit, execution_cost);
-            warn!("🛡️ {}", msg);
-            return Err(MEVError::SimulationFailed(msg));
+            return Err(MEVError::SimulationFailed(format!(
+                "Unprofitable: Profit {} <= Total Cost {}", top_sim.profit, execution_cost
+            )));
         }
 
         if !top_sim.success {
@@ -233,6 +212,7 @@ impl FlashLoanExecutor {
 
         let bribe_wei = (net_profit * U256::from(bribe_pct)) / U256::from(100u64);
 
+        let builder = self.bundle_builder.as_ref().ok_or(MEVError::Other("BundleBuilder missing".into()))?;
         let signer = &builder.config.signer; // Field made public in bundle_builder.rs
 
         // Pillar I: Calculate Ultra-Precise Gas for Submission
@@ -255,59 +235,46 @@ impl FlashLoanExecutor {
         let signed_tx = tx_request.build(&wallet).await
             .map_err(|e| MEVError::Other(format!("FlashLoan Signing Failed: {}", e)))?;
         
-        // Mark pools as occupied for this block before broadcasting
-        for hop in &opp.path.hops {
-            self.occupied_pools.insert((target_block, hop.pool_address), opp.id.clone());
-        }
-
         let signed_rlp = signed_tx.encoded_2718(); // Requires Encodable2718 trait
         let tx_hash = *signed_tx.tx_hash(); // Bug Fix: use tx_hash()
         
-        let mut attempts = 0;
-        let max_resilience_attempts = 2; // Target current block and the next one if it fails
+        let mut bundle = Bundle::new();
+        bundle.target_block = builder.block_tracker.current() + 1;
+        bundle.transactions = vec![signed_rlp];
+        bundle.set_bribe(bribe_wei);
 
-        loop {
-            let mut bundle = Bundle::new();
-            bundle.target_block = target_block;
-            bundle.transactions = vec![signed_rlp.to_vec()];
-            bundle.set_bribe(bribe_wei);
+        info!("📡 [PILLAR I] Bidding {}% ({} wei) for opp={} | TxHash: {:?}", bribe_pct, bribe_wei, opp.id, tx_hash);
 
-            info!("📡 [PILLAR I] Bidding {}% ({} wei) for opp={} | Block={} | Attempt={}/{}", 
-                bribe_pct, bribe_wei, opp.id, target_block, attempts + 1, max_resilience_attempts);
-
-            let broadcast_results: Vec<Result<(), String>> = builder.broadcast_bundle(bundle).await;
-            let success_count = broadcast_results.iter().filter(|r| r.is_ok()).count();
-            
-            // Pillar S: Systemic Self-Healing & Calibration
-            if success_count > 0 {
-                info!("✅ [TX] Bundle accepted by {} relays! Inclusion in block {} expected.", success_count, target_block);
-                self.bidding_engine.record_success(opp, bribe_pct);
-                self.circuit_breaker.record_success();
-                return Ok(tx_hash);
+        // Pillar S: Multi-Relay Strategic Submission
+        // Base builders need ultra-low latency. We broadcast to all relays in parallel 
+        // and monitor for "Flashbots-Specific" rejection codes to self-correct.
+        let builder_clone = builder.clone();
+        let broadcast_results: Vec<Result<(), String>> = builder_clone.broadcast_bundle(bundle).await;
+        
+        let success_count = broadcast_results.iter().filter(|r| r.is_ok()).count();
+        
+        info!("📡 [RELAY] Attempted to broadcast bundle to {} relays: {:?}", builder.config.relays.len(), builder.config.relays);
+        // Pillar S: Systemic Self-Healing & Calibration
+        if success_count > 0 {
+            info!("✅ [TX] Bundle accepted by {} relays! Recording success.", success_count);
+            self.bidding_engine.record_success(opp, bribe_pct);
+            self.circuit_breaker.record_success();
+            Ok(tx_hash)
+        } else {
+            // Pillar N: Zero-Loss Rejection Analysis
+            let err_msg = format!("{:?}", broadcast_results);
+            if err_msg.contains("0x937c4424") || err_msg.to_lowercase().contains("zerolossshield") {
+                warn!("🛡️ [SHIELD] On-chain Revert Protected for opp={}. Gas saved, no loss.", opp.id);
+                self.circuit_breaker.record_failure(FailureType::Slippage);
+            } else if err_msg.contains("nonce too low") {
+                warn!("🔄 [NONCE] Collision detected on relay. Forcing nonce refresh...");
+                self.nonce_manager.refresh().await;
             } else {
-                let err_msg = format!("{:?}", broadcast_results);
-                
-                // Pillar R: Block-Skip Resilience Logic
-                // Agar latency ki wajah se block nikal gaya, toh nonce recycle karke turant agle block ke liye try karo.
-                let is_stale = err_msg.contains("already passed") || err_msg.contains("stale") || err_msg.contains("expired");
-                if is_stale && attempts < max_resilience_attempts - 1 {
-                    warn!("⏳ [BLOCK-SKIP] Block {} passed for opp={}. Re-broadcasting for block {}...", target_block, opp.id, target_block + 1);
-                    target_block += 1;
-                    attempts += 1;
-                    continue;
-                }
-
-                // Pillar N: Zero-Loss Rejection Analysis
-                if err_msg.contains("0x937c4424") || err_msg.to_lowercase().contains("zerolossshield") {
-                    warn!("🛡️ [SHIELD] Atomic Revert Protected for opp={}. Gas saved, no loss.", opp.id);
-                    self.circuit_breaker.record_failure(FailureType::Slippage);
-                } else {
-                    error!("❌ [TX] Bundle rejected for opp={}. Msg: {}", opp.id, err_msg);
-                    self.circuit_breaker.record_failure(FailureType::Other);
-                }
-                self.bidding_engine.record_failure(opp);
-                return Err(MEVError::NoRelayAccepted);
+                error!("❌ [TX] Relay Blackout: All {} relays rejected. Check block tracker.", broadcast_results.len());
+                self.circuit_breaker.record_failure(FailureType::Other);
             }
+            self.bidding_engine.record_failure(opp);
+            Err(MEVError::NoRelayAccepted)
         }
     }
 

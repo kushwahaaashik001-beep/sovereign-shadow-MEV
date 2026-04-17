@@ -7,23 +7,12 @@ use thiserror::Error;
 #[repr(u64)]
 pub enum Chain {
     #[default]
-    Mainnet = 1,
     Base = 8453,
-    Arbitrum = 42161,
-    Optimism = 10,
-    Polygon = 137,
 }
 
 impl Chain {
     pub fn try_from_id(id: u64) -> Option<Self> {
-        match id {
-            1 => Some(Chain::Mainnet),
-            8453 => Some(Chain::Base),
-            42161 => Some(Chain::Arbitrum),
-            10 => Some(Chain::Optimism),
-            137 => Some(Chain::Polygon),
-            _ => None,
-        }
+        if id == 8453 { Some(Chain::Base) } else { None }
     }
 }
 
@@ -127,8 +116,7 @@ impl Path {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArbitragePath {
     pub hops: Vec<Hop>,
-    pub loan_token: Address,
-    pub loan_amount: U256,
+    pub loans: Vec<(Address, U256)>,
     pub lender: Lender,
 }
 

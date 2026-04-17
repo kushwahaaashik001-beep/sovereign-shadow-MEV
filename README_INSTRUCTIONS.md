@@ -1,41 +1,45 @@
-# 🥷 THE SOVEREIGN SHADOW: DEPLOYMENT MANUAL
+# 🥷 THE SOVEREIGN SHADOW: MISSION CONTROL v2.0 (Hybrid High-Efficiency)
 
-Ye aapka exact command-line guide hai Base Mainnet par unified bot ko zero error ke saath start karne ke liye (Single Instance Deployment).
+Ye aapka core architectural blueprint hai. Humne P2P/Sentry logic ko delete karke **Private Relay (Flashbots/MEV-Blocker)** switch kar liya hai. 
+Target: **$50-$100 Daily Micro-Profits** via Meme Token Cycles on Base Mainnet.
 
-## Phase 1: Environment Setup
+## 🚀 Tech Stack Breakdown
+- **Language:** Rust (Stable/Nightly) for ultra-nanosecond math.
+- **Provider:** Alloy (High-performance abstraction).
+- **Simulation:** REVM 14.0 (In-process EVM for instant honeypot detection).
+- **Execution:** Yul-optimized ShadowBot.sol + Private Bundles (Flashbots).
+- **Infrastructure:** Hugging Face Space (Single Instance, 16GB RAM).
+
+## 🛠️ Phase 1: Environment Setup (No Node Required)
 
 1. **Install Rust Compiler:**
    ```bash
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    ```
 
-2. **Install Foundry (For Contract Deployment):**
-   ```bash
-   curl -L https://foundry.paradigm.xyz | bash
-   foundryup
-   ```
-
-3. **Configure Environment Variables:**
+2. **Configure Secrets (.env):**
    `.env` file ko open karein aur ye values set karein:
    ```env
-   # Use multiple keys to avoid 429 V2 Rate Limits
-   SHADOW_RPC_URL_1=https://base-mainnet.g.alchemy.com/v2/KEY_1
-   SHADOW_RPC_URL_2=https://base-mainnet.g.alchemy.com/v2/KEY_2
-   SHADOW_WS_URL_1=wss://base-mainnet.g.alchemy.com/v2/KEY_1
-   SHADOW_PRIVATE_KEY=0xYOUR_WALLET_PRIVATE_KEY
+   # READ: Hybrid RPC (Alchemy/Quicknode)
+   SHADOW_RPC_URL=https://base-mainnet.g.alchemy.com/v2/YOUR_KEY
+   SHADOW_WS_URL=wss://base-mainnet.g.alchemy.com/v2/YOUR_KEY
+   
+   # WRITE: Private Relay Keys
+   PRIVATE_KEY=0xYOUR_EXECUTION_WALLET_KEY
+   RELAY_SIGNING_KEY=0xYOUR_FLASHBOTS_ID_KEY
+
+   # CONTRACTS
    CHAIN=base
-   EXECUTOR_ADDRESS=0x0000000000000000000000000000000000000000 # Pehle deployment ke baad badlein
-   TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
-   TELEGRAM_CHAT_ID=YOUR_CHAT_ID
+   EXECUTOR_ADDRESS=0x... # Deployed ShadowBot Address
    ```
 
-## Phase 2: Deploy The Ghost Executor
+## 🛡️ Phase 2: Deploy The Yul-Optimized Ghost
 
-Aapka ShadowBot contract Base Mainnet par deploy karne ke liye ye command run karein:
+Aapka ShadowBot contract (Yul optimization ke saath) deploy karein:
 ```bash
 forge create src/ShadowBot.sol:ShadowBot \
   --rpc-url https://mainnet.base.org \
-  --private-key 0xYOUR_REAL_BASE_PRIVATE_KEY \
+  --private-key 0xYOUR_PRIVATE_KEY \
   --broadcast
 ```
 *Deploy hone ke baad `Deployed to: 0x...` wala address copy karke `.env` ki `EXECUTOR_ADDRESS` field mein daal dein.*

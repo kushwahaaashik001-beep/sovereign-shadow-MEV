@@ -5,8 +5,8 @@ use alloy::rpc::types::Filter;
 use alloy_primitives::B256;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{info, warn, error};
-use crate::factory_scanner::{NewPoolEvent, V2PoolData, V3PoolData};
+use tracing::{error, info, warn};
+use crate::factory_scanner::{NewPoolEvent, V2PoolData};
 use crate::models::{Chain, DexName};
 use crate::constants;
 
@@ -28,20 +28,34 @@ impl Discovery {
         
         if self.chain == Chain::Base {
             let core_pools = vec![
-                // Primary Liquidity Hubs (WETH-USDC)
-                NewPoolEvent::V3(V3PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_USDC, fee: 500, pool: constants::POOL_UNIV3_WETH_USDC_005, dex_name: DexName::UniswapV3 }),
-                NewPoolEvent::V3(V3PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_USDC, fee: 3000, pool: constants::POOL_UNIV3_WETH_USDC_030, dex_name: DexName::UniswapV3 }),
+                // Primary Meme Liquidity Hubs (WETH-USDC V2/Aero)
                 NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_USDC, pair: constants::POOL_BASESWAP_WETH_USDC, dex_name: DexName::BaseSwap }),
                 NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_USDC, pair: constants::POOL_AERO_WETH_USDC, dex_name: DexName::Aerodrome }),
                 NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_USDC, pair: constants::POOL_SUSHI_WETH_USDC, dex_name: DexName::SushiSwap }),
                 NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_USDC, pair: constants::POOL_PANCAKESWAP_WETH_USDC, dex_name: DexName::PancakeSwap }),
 
-                // Secondary alpha clusters (WETH-AERO, WETH-DEGEN)
+                // Alpha Cluster: DEGEN Multi-Hop Bridges
+                // In pools par competition kam hai aur triangular arb ke mauke zyada hain.
                 NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_AERO, pair: constants::POOL_AERO_WETH_AERO, dex_name: DexName::Aerodrome }),
                 NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_DEGEN, pair: constants::POOL_UNIV2_WETH_DEGEN, dex_name: DexName::UniswapV2 }),
-                
-                // Cross-alpha edges (USDC-DEGEN)
                 NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_USDC, token_1: constants::TOKEN_DEGEN, pair: constants::POOL_UNIV2_USDC_DEGEN, dex_name: DexName::UniswapV2 }),
+
+                // Alpha Cluster: BRETT & Yield Tokens
+                // BRETT/AERO aur BRETT/WETH ke beech price hamesha sync nahi rehta.
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_BRETT, pair: constants::POOL_AERO_WETH_BRETT, dex_name: DexName::Aerodrome }),
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_CBETH, token_1: constants::TOKEN_WETH, pair: alloy_primitives::address!("0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"), dex_name: DexName::BaseSwap }),
+
+                // The "Scavenger Bridge": Degen to Ecosystem
+                // Ye rasta bade bots kabhi scan nahi karte.
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_DEGEN, token_1: constants::TOKEN_AERO, pair: alloy_primitives::address!("0x532f27101965dd16442E59d40670Fa5ad5f3fe91"), dex_name: DexName::BaseSwap }),
+                
+                // Gaming/Meme Alpha Bridge
+                NewPoolEvent::V2(V2PoolData { 
+                    token_0: constants::TOKEN_WETH, 
+                    token_1: alloy_primitives::address!("0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed"), // DEGEN 
+                    pair: alloy_primitives::address!("0x3D2d7681335A74Be482D207137f814bA688849E8"), 
+                    dex_name: DexName::UniswapV2 
+                }),
             ];
 
             let mut count = 0;
@@ -67,7 +81,6 @@ impl Discovery {
             let start_block = current_block.saturating_sub(500); // Keep this small to avoid RPC limits
 
             let v2_topic = B256::from(constants::EVENT_V2_PAIR_CREATED);
-            let v3_topic = B256::from(constants::EVENT_V3_POOL_CREATED);
 
             let mut current_start = start_block;
             let step = 500; // Smaller chunks to prevent timeouts and RPC rejections
@@ -77,7 +90,7 @@ impl Discovery {
                 let filter = Filter::new()
                     .from_block(current_start)
                     .to_block(current_end)
-                    .event_signature(vec![v2_topic, v3_topic]);
+                    .event_signature(vec![v2_topic]); // Target only V2-style Meme Factories
 
                 match provider.get_logs(&filter).await {
                     Ok(logs) => {
@@ -92,18 +105,6 @@ impl Discovery {
                                     let pair = Address::from_slice(&data[12..32]);
                                     let _ = pool_tx.send(NewPoolEvent::V2(V2PoolData { 
                                         token_0: token0, token_1: token1, pair, dex_name: DexName::UniswapV2 
-                                    }));
-                                    count += 1;
-                                }
-                            } else if !topics.is_empty() && topics[0] == v3_topic && topics.len() >= 4 {
-                                let token0 = Address::from_word(topics[1]);
-                                let token1 = Address::from_word(topics[2]);
-                                if data.len() >= 64 {
-                                    // Fee is indexed in topics[3], not in data
-                                    let fee = u32::from_be_bytes([0, topics[3][29], topics[3][30], topics[3][31]]);
-                                    let pool = Address::from_slice(&data[44..64]);
-                                    let _ = pool_tx.send(NewPoolEvent::V3(V3PoolData { 
-                                        token_0: token0, token_1: token1, fee, pool, dex_name: DexName::UniswapV3 
                                     }));
                                     count += 1;
                                 }

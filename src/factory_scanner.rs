@@ -101,14 +101,11 @@ impl FactoryScanner {
                 map.insert(constants::BASE_PANCAKESWAP_FACTORY, DexName::PancakeSwap);
                 map.insert(constants::BASE_SUSHISWAP_FACTORY, DexName::SushiSwap);
                 map.insert(constants::BASE_MAVERICK_FACTORY, DexName::Maverick);
-                // Uniswap V3 Factory on Base
                 map.insert("0x33128a8fC170d56ED8068699e168a9A301C035De".parse().unwrap(), DexName::UniswapV3);
+                // Add SwapBased and AlienBase for extra Alpha
+                map.insert("0x04C9F118A4864700721A163744021d21DB27c11f".parse().unwrap(), DexName::UniswapV2); // SwapBased
+                map.insert("0x3D2d7681335A74Be482D207137f814bA688849E8".parse().unwrap(), DexName::UniswapV2); // AlienBase
             }
-            Chain::Mainnet => {
-                map.insert(constants::UNISWAP_V2_FACTORY, DexName::UniswapV2);
-                map.insert("0x1F98431c8aD98523631AE4a59f267346ea31F984".parse().unwrap(), DexName::UniswapV3);
-            }
-            _ => warn!("Factory addresses not fully mapped for chain {:?}", self.chain),
         }
     }
 

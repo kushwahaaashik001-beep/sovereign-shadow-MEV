@@ -123,12 +123,6 @@ impl BiddingEngine {
             bribe_pct = bribe_pct.max(94); // Mafia Mode: "Win at all costs"
         }
 
-        if opp.chain == Chain::Mainnet {
-            let priority = self.state_mirror.current_priority_fee();
-            if priority > U256::from(10_000_000_000u64) { bribe_pct = bribe_pct.max(90); }
-            else if priority > U256::from(5_000_000_000u64) { bribe_pct = bribe_pct.max(80); }
-        }
-        
         if is_whale {
             bribe_pct = (bribe_pct + 10).min(MAX_BRIBE_PCT);
         }

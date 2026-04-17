@@ -11,11 +11,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rustc_hash::FxHasher;
 use std::hash::BuildHasherDefault;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use crate::models::DexType;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 pub const MULTICALL_BATCH_SIZE: usize = 200;
+pub const PRICE_CACHE_TTL: u64 = 1; // 1-second TTL for HTTP state
 
 sol! {
     #[sol(rpc)]
@@ -23,6 +24,14 @@ sol! {
         address target;
         bool allowFailure;
         bytes callData;
+    }
+
+    #[sol(rpc)]
+    struct PoolMetaData {
+        uint8 decimals0;
+        uint8 decimals1;
+        string symbol0;
+        string symbol1;
     }
 
     #[sol(rpc)]
@@ -61,6 +70,8 @@ pub struct PoolState {
     pub ticks: Arc<FxHashMap<i32, (i128, u128)>>,
     pub tick_bitmap: Arc<FxHashMap<i16, U256>>,
     pub last_swap_timestamp: u64,
+    pub last_http_update: Option<Instant>,
+    pub last_access_ts: u64,
 }
 
 impl Default for PoolState {
@@ -79,6 +90,8 @@ impl Default for PoolState {
             ticks: Arc::new(FxHashMap::default()),
             tick_bitmap: Arc::new(FxHashMap::default()),
             last_swap_timestamp: 0,
+            last_http_update: None,
+            last_access_ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
         }
     }
 }
@@ -228,16 +241,26 @@ impl StateMirror {
         false
     }
 
-    /// Pillar B: Sub-block Batch Sync Logic.
-    pub async fn sync_all_pools_multicall<P: Provider<BoxTransport>>(&self, provider: Arc<P>) -> Result<(), crate::models::MEVError> {
-        let pool_addresses: Vec<(Address, DexType)> = self.pools.iter().map(|entry| (*entry.key(), entry.value().dex_type)).collect::<Vec<_>>();
+    /// THE POOLED LENS: Uses the provider pool to rotate keys for every chunk.
+    /// This ensures we stay under rate limits even with 5000+ pools.
+    pub async fn sync_all_pools_multicall_pooled(&self, pool: Arc<crate::WsProviderPool>) -> Result<(), crate::models::MEVError> {
+        let pool_addresses: Vec<(Address, DexType)> = self.pools.iter()
+            .filter(|e| {
+                let block_gap = self.current_block_number().saturating_sub(e.value().last_updated_block);
+                block_gap > 0 || self.dirty_flag.load(Ordering::Acquire)
+            })
+            .map(|entry| (*entry.key(), entry.value().dex_type))
+            .collect::<Vec<_>>();
+            
         if pool_addresses.is_empty() { return Ok(()); }
 
-        let multicall_addr = alloy_primitives::address!("0xcA11bde05977b3631167028862bE2a173976CA11");
-        let multicall = IMulticall3::IMulticall3Instance::new(multicall_addr, provider.clone());
         let current_block = self.current_block_number();
+        let multicall_addr = alloy_primitives::address!("0xcA11bde05977b3631167028862bE2a173976CA11");
 
         for chunk in pool_addresses.chunks(MULTICALL_BATCH_SIZE) {
+            let provider = pool.next(); // ROTATE KEY FOR EVERY CHUNK
+            let multicall = IMulticall3::IMulticall3Instance::new(multicall_addr, provider);
+            
             let mut calls = Vec::with_capacity(chunk.len() * 2);
             for (addr, dex_type) in chunk {
                 match dex_type {
@@ -248,10 +271,11 @@ impl StateMirror {
                             callData: IV2Pair::getReservesCall {}.abi_encode().into(),
                         });
                     }
-                    DexType::UniswapV3 | DexType::MaverickV2 => {
+                    DexType::UniswapV3 => {
                         calls.push(Call3 { target: *addr, allowFailure: true, callData: IV3Pool::slot0Call {}.abi_encode().into() });
                         calls.push(Call3 { target: *addr, allowFailure: true, callData: IV3Pool::liquidityCall {}.abi_encode().into() });
                     }
+                    _ => {}
                 }
             }
 
@@ -273,14 +297,12 @@ impl StateMirror {
                                 }
                             }
                         }
-                        DexType::UniswapV3 | DexType::MaverickV2 => {
+                        DexType::UniswapV3 => {
                             let slot0_res = results_iter.next();
                             let liq_res = results_iter.next();
                             if let (Some(s0), Some(l)) = (slot0_res, liq_res) {
                                 if s0.success && l.success {
-                                    let s0_dec = IV3Pool::slot0Call::abi_decode_returns(&s0.returnData.0, true);
-                                    let l_dec = IV3Pool::liquidityCall::abi_decode_returns(&l.returnData.0, true);
-                                    if let (Ok(s), Ok(liq)) = (s0_dec, l_dec) {
+                                    if let (Ok(s), Ok(liq)) = (IV3Pool::slot0Call::abi_decode_returns(&s0.returnData.0, true), IV3Pool::liquidityCall::abi_decode_returns(&l.returnData.0, true)) {
                                         state.sqrt_price_x96 = U256::from(s.sqrtPriceX96);
                                         state.tick = s.tick.as_i32();
                                         state.liquidity = U256::from(liq._0);
@@ -289,12 +311,14 @@ impl StateMirror {
                                 }
                             }
                         }
+                        _ => {}
                     }
                 }
                 self.batch_update_reserves(updates);
             }
         }
-
+        
+        self.dirty_flag.store(false, Ordering::Release);
         self.last_multicall_sync.store(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(), Ordering::Release);
         Ok(())
     }
@@ -307,21 +331,29 @@ impl StateMirror {
         self.poisoned_accounts.contains_key(address)
     }
 
-    pub fn prune_stale_pools(&self, max_age_blocks: u64) {
+    pub fn prune_stale_pools(&self, _max_age_blocks: u64) {
         let current = self.current_block_number();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         if current == 0 { return; }
-        self.pools.retain(|_, pool| {
-            let age = if pool.last_updated_block == 0 { 0 } else { current.saturating_sub(pool.last_updated_block) };
-            // FIX: Bootstrap pools have reserves=0 until first multicall sync.
-            // Keep pools with last_updated_block=0 (newly seeded, not yet synced by multicall).
-            let is_new_unsync = pool.last_updated_block == 0;
-            let has_data = pool.reserves0 > U256::ZERO || pool.sqrt_price_x96 > U256::ZERO;
-            age <= max_age_blocks && (is_new_unsync || has_data)
+
+        // Pillar S: LRU Heat-Map Pruning
+        // We strictly keep pools that:
+        // 1. Are Core pools (Legitimate Bridges).
+        // 2. Have seen on-chain activity in the last 5 blocks (Heat).
+        // 3. Have been accessed by the pathfinder in the last 60 seconds (LRU).
+        self.pools.retain(|addr, pool| {
+            if crate::constants::CORE_POOLS.contains(addr) { return true; }
+            
+            let block_age = if pool.last_updated_block == 0 { 0 } else { current.saturating_sub(pool.last_updated_block) };
+            let time_since_access = now.saturating_sub(pool.last_access_ts);
+            
+            // Heat criteria: Updated in last 5 blocks OR accessed in last 60s
+            let is_hot = block_age < 5 || time_since_access < 60;
+            let is_new = pool.last_updated_block == 0;
+            
+            is_hot || is_new
         });
-        if self.pools.len() > 2500 {
-            // Keep new unsynced pools + recently active pools
-            self.pools.retain(|_, p| p.last_updated_block == 0 || current.saturating_sub(p.last_updated_block) < 5);
-        }
+
         if self.bytecodes.len() > 500 {
             self.bytecodes.retain(|addr, _| self.pools.contains_key(addr));
         }
@@ -342,13 +374,16 @@ impl StateMirror {
         self.gas_state.store(Arc::new(new_gas));
     }
 
-    pub fn get_pool_data(&self, address: &Address, max_age_blocks: u64) -> Option<PoolState> {
-        self.pools.get(address).and_then(|p| {
-            let current = self.current_block.load(Ordering::Acquire);
-            if p.last_updated_block == 0 || current.saturating_sub(p.last_updated_block) <= max_age_blocks {
-                Some(p.clone())
-            } else { None }
-        })
+    pub fn get_pool_data(&self, address: &Address, _max_age_blocks: u64) -> Option<PoolState> {
+        // Pillar S: Update LRU Heat-Map on Access
+        if let Some(mut entry) = self.pools.get_mut(address) {
+            entry.last_access_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            
+            // NANOSECOND SCALE: Trust the local mirror 100%. 
+            // WebSocket logs are faster than block polling.
+            return Some(entry.value().clone());
+        }
+        None
     }
 
     pub fn batch_update_reserves(&self, updates: Vec<(Address, PoolState)>) {

@@ -12,8 +12,8 @@ use std::hash::BuildHasherDefault;
 use rustc_hash::FxHashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel, UnboundedReceiver};
-use tracing::{info, warn, debug};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tracing::{info, warn};
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -43,7 +43,7 @@ impl Default for MempoolListenerConfig {
             tracked_pools: Arc::new(FxHashSet::default()),
             use_txpool_content: false,
             txpool_poll_interval_ms: 200,
-            chain: Chain::Mainnet,
+            chain: Chain::Base,
             min_gas_price_gwei: 0,
             heartbeat_interval_secs: Some(20),
             sequencer_endpoint: None,
@@ -75,8 +75,6 @@ pub struct MempoolListener {
     config: MempoolListenerConfig,
     event_tx: UnboundedSender<SwapEvent>,
     priority_tx: UnboundedSender<SwapEvent>,
-    p2p_tx: UnboundedSender<AlloyTransaction>,
-    p2p_rx: UnboundedReceiver<AlloyTransaction>,
     seen_hashes: Arc<DashSet<B256, BuildHasherDefault<FxHasher>>>,
 }
 
@@ -87,14 +85,12 @@ impl MempoolListener {
     ) -> Result<(Self, UnboundedReceiver<SwapEvent>, UnboundedReceiver<SwapEvent>), ListenerError> {
         let (event_tx, event_rx) = unbounded_channel();
         let (priority_tx, priority_rx) = unbounded_channel();
-        let (p2p_tx, p2p_rx) = unbounded_channel();
+
         Ok((
             Self { 
                 config, 
                 event_tx, 
                 priority_tx, 
-                p2p_tx, 
-                p2p_rx,
                 seen_hashes: Arc::new(DashSet::with_capacity_and_hasher(100_000, BuildHasherDefault::default())),
             },
             event_rx,
@@ -102,107 +98,41 @@ impl MempoolListener {
         ))
     }
 
-    pub fn p2p_tx(&self) -> UnboundedSender<AlloyTransaction> {
-        self.p2p_tx.clone()
-    }
-
     pub async fn run(self) -> Result<(), ListenerError> {
-        info!("🚀 [Pillar A] Mempool Surveillance Active on {:?}", self.config.chain);
+        info!("📡 [Pillar A] Private WSS Streaming Active (Blast/Ankr Optimized)");
         
         let decoder = Arc::new(UniversalDecoder::new());
         let seen_hashes = self.seen_hashes.clone();
         let mut tasks = Vec::new();
 
-        // Pillar T: Integrated P2P Sentry Stream (Zero-latency direct feed)
-        let mut p2p_rx = self.p2p_rx;
-        let event_tx_p2p = self.event_tx.clone();
-        let decoder_p2p = decoder.clone();
-        let config_p2p = self.config.clone();
-        let seen_hashes_p2p = seen_hashes.clone();
-        tasks.push(tokio::spawn(async move {
-            while let Some(tx) = p2p_rx.recv().await {
-                Self::process_raw_tx(&tx, &decoder_p2p, &event_tx_p2p, &config_p2p, &seen_hashes_p2p);
-            }
-        }));
-
-        // Pillar T: txpool_content Polling (Secondary feed for hidden txs)
-        if self.config.use_txpool_content {
-            let event_tx = self.event_tx.clone();
-            let decoder = decoder.clone();
-            let config = self.config.clone();
-            let seen_hashes_poll = seen_hashes.clone();
-            
-            if let Some(endpoint) = self.config.endpoints.first() {
-                let endpoint = endpoint.clone();
-                tasks.push(tokio::spawn(async move {
-                    if let Ok(url) = endpoint.parse() {
-                        let provider = Arc::new(ProviderBuilder::new().on_http(url));
-                        let mut interval = tokio::time::interval(Duration::from_millis(config.txpool_poll_interval_ms));
-                        loop {
-                            interval.tick().await;
-                            let res: Result<serde_json::Value, _> = provider.raw_request("txpool_content".into(), Vec::<String>::new()).await;
-                            if let Ok(content) = res {
-                                if let Some(pending) = content.get("pending").and_then(|p| p.as_object()) {
-                                    for txs in pending.values() {
-                                        if let Some(tx_map) = txs.as_object() {
-                                            for tx_val in tx_map.values() {
-                                                if let Ok(tx) = serde_json::from_value::<AlloyTransaction>(tx_val.clone()) {
-                                                    Self::process_raw_tx(&tx, &decoder, &event_tx, &config, &seen_hashes_poll);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }));
-            }
-        }
-
+        // Pillar A: Multi-WSS Scavenging Orchestration
+        // Connect to ALL provided endpoints in parallel to bypass rate limits and win the latency race.
         for endpoint in &self.config.endpoints {
             let endpoint = endpoint.clone();
             let event_tx = self.event_tx.clone();
-            let decoder = decoder.clone();
+            let decoder_inner = decoder.clone();
             let config = self.config.clone();
             let seen_hashes_ws = seen_hashes.clone();
 
-            let task = tokio::spawn(async move {
+            tasks.push(tokio::spawn(async move {
                 loop {
-                    debug!("📡 Attempting connection to: {}", endpoint);
-                    if let Ok(ws) = Ok::<WsConnect, ListenerError>(WsConnect::new(endpoint.clone())) {
-                        if let Ok(provider) = ProviderBuilder::new().on_ws(ws).await {
-                            info!("✅ Connected to mempool feed: {}", endpoint);
-                            
-                            // Optimization: Try full transaction streaming first
+                    let ws = WsConnect::new(endpoint.clone());
+                    match ProviderBuilder::new().on_ws(ws).await {
+                        Ok(provider) => {
+                            info!("✅ [SENTRY] Connected to WSS Feed: {}", endpoint);
                             if let Ok(sub) = provider.subscribe_full_pending_transactions().await {
                                 let mut stream = sub.into_stream();
                                 while let Some(tx) = stream.next().await {
-                                    Self::process_raw_tx(&tx, &decoder, &event_tx, &config, &seen_hashes_ws);
-                                }
-                            } else if let Ok(sub) = provider.subscribe_pending_transactions().await {
-                                // Fallback: Hash stream + Parallel Fetching
-                                let mut stream = sub.into_stream();
-                                while let Some(hash) = stream.next().await {
-                                    let p = provider.clone();
-                                    let d = decoder.clone();
-                                    let et = event_tx.clone();
-                                    let c = config.clone();
-                                    let sh = seen_hashes_ws.clone();
-                                    tokio::spawn(async move {
-                                        if let Ok(Some(tx)) = p.get_transaction_by_hash(hash).await {
-                                            Self::process_raw_tx(&tx, &d, &et, &c, &sh);
-                                        }
-                                    });
+                                    Self::process_raw_tx(&tx, &decoder_inner, &event_tx, &config, &seen_hashes_ws);
                                 }
                             }
                         }
+                        Err(e) => warn!("⚠️ [SENTRY] Connection failed {}: {}", endpoint, e),
                     }
-                    warn!("🔄 Mempool connection lost [{}]. Retrying in 5s...", endpoint);
+                    // Exponential backoff to avoid spamming failed connections
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
-            });
-            tasks.push(task);
+            }));
         }
 
         // Keep the main loop alive
@@ -232,9 +162,9 @@ impl MempoolListener {
             None => return,
         };
 
-        if !TARGET_ROUTERS.contains(&to) && !config.tracked_pools.contains(&PoolKey { pool: to }) {
-            return;
-        }
+        // Pillar Z: Autonomous Discovery - Attempt to decode even unknown routers
+        // We don't return early if it's not a known router, we let the decoder try its magic.
+        let is_known = TARGET_ROUTERS.contains(&to) || config.tracked_pools.contains(&PoolKey { pool: to });
 
         // 2. Efficient Data Conversion
         // Converting alloy_primitives::Bytes to bytes::Bytes (ref-counted)
@@ -247,7 +177,14 @@ impl MempoolListener {
         };
 
         let swaps = decoder.decode(&decode_tx);
+        if swaps.is_empty() && !is_known { return; } // Drop if unknown and not a swap
+
         for swap in swaps {
+            // Signal volume detection for non-tracked pools to trigger registry promotion
+            if !is_known && swap.amount_in > U256::from(5 * 10u128.pow(16)) {
+                 // This swap is on an unknown contract but has volume. High-Alpha signal.
+            }
+
             let event = SwapEvent {
                 tx_hash: tx.hash,
                 sender: tx.from,

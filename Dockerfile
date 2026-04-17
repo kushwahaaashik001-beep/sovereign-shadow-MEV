@@ -1,54 +1,32 @@
-# --- STAGE 1: BUILD ENGINE ---
-FROM rust:latest AS builder
+# --- Build Stage ---
+FROM rust:1.75-slim-bookworm as builder
 
-# Install build-essential tools for high-performance crates (secp2k1, alloy)
+# Install system dependencies for compilation (needed for OpenSSL/crypto)
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
-    cmake \
-    git \
-    protobuf-compiler \
-    g++ \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /usr/src/app
+WORKDIR /app
 COPY . .
 
-# Pillar HF: Resolve Dependency Version Conflicts
-# Some crates (serde_with, icu) are requesting futuristic Rust versions (1.86/1.88).
-# We force them to the last stable versions compatible with Rust 1.85.
-RUN cargo update -p serde_with --precise 3.11.0 || true && \
-    cargo update -p serde_with_macros --precise 3.11.0 || true && \
-    cargo update -p icu_provider --precise 1.5.0 || true && \
-    cargo update -p icu_locid --precise 1.5.0 || true && \
-    cargo update -p icu_locid_transform --precise 1.5.0 || true && \
-    cargo update -p icu_normalizer --precise 1.5.0 || true && \
-    cargo update -p icu_normalizer_data --precise 1.5.0 || true && \
-    cargo update -p icu_properties --precise 1.5.0 || true && \
-    cargo update -p icu_properties_data --precise 1.5.0 || true && \
-    cargo update -p icu_collections --precise 1.5.0 || true && \
-    cargo update -p toml_edit --precise 0.22.22 || true && \
-    cargo update -p hashbrown --precise 0.14.5 || true
+# Build with release profile for nanosecond performance
+RUN cargo build --release
 
-# Build with memory limits to prevent Hugging Face OOM
-ENV PROTOC_NO_VENDOR=1
-RUN CARGO_NET_GIT_FETCH_WITH_CLI=true \
-    cargo build --release --jobs 1
-
-# --- STAGE 2: THE FORTRESS RUNTIME ---
+# --- Runtime Stage ---
 FROM debian:bookworm-slim
 
-# Install minimal runtime dependencies (SSL for RPC, CA-Certs for HTTPS)
+# Install runtime dependencies
 RUN apt-get update && apt-get install -y \
-    libssl3 \
+    libssl-dev \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=builder /usr/src/app/target/release/the-sovereign-shadow /app/
+COPY --from=builder /app/target/release/the-sovereign-shadow .
 
-# Pillar HF: Ensure the bot listens on the port provided by Hugging Face
-ENV PORT=7860
-EXPOSE 7860
+# Ensure binary is executable for Hugging Face
+RUN chmod +x the-sovereign-shadow
 
-CMD ["./the-sovereign-shadow"]
+ENTRYPOINT ["./the-sovereign-shadow"]
