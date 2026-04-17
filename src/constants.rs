@@ -40,11 +40,11 @@ pub const POOL_AERO_WETH_AERO:      Address = addr!("7f670f78B17dEC44d5Ef68a4874
 pub const POOL_AERO_WETH_BRETT:     Address = addr!("532f27101965dd16442E59d40670Fa5ad5f3fe91");
 
 pub const MOONWELL_COMPTROLLER:     Address = addr!("BBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb");
-pub const MIN_NET_PROFIT_USD_WEI:   u128 = 80_000_000_000_000; // Alpha Hunter: Targetting $0.20+ for micro-scalping
+pub const MIN_NET_PROFIT_USD_WEI:   u128 = 60_000_000_000_000; // Scavenger: $0.15 threshold for $40/day goal
 
 // Alpha Hunter: Sweet Spot Liquidity Range ($2k - $30k)
-pub const MIN_ALPHA_LIQUIDITY_USD: u128 = 2_000;
-pub const MAX_ALPHA_LIQUIDITY_USD: u128 = 30_000;
+pub const MIN_ALPHA_LIQUIDITY_USD: u128 = 300; // Micro-liquidity capture for stealth arbs
+pub const MAX_ALPHA_LIQUIDITY_USD: u128 = 40_000; 
 pub const ESTIMATED_ETH_PRICE: u128 = 2_500; // Used for quick in-memory liquidity filtering
 
 pub const POOL_HOTNESS_TTL_SEC: u64 = 1800; // 30 minutes for Autonomous Discovery

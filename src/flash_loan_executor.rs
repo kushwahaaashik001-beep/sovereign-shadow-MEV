@@ -235,12 +235,12 @@ impl FlashLoanExecutor {
 
         // Pillar Y: Dynamic Scavenger Filter
         // Instead of a hard $2, we scale based on current network congestion.
-        // If gas is low, we take smaller, high-frequency profits to reach the $100/day goal.
+        // Scavenger Chaal: Targeting $0.15 - $0.50 range for $2 budget sustainability.
         let current_gas_price = total_gas_price;
         let min_threshold = if current_gas_price < U256::from(500_000_000u64) { // Gas < 0.5 gwei
-            U256::from(400_000_000_000_000u128) // $1.00 minimum
+            U256::from(60_000_000_000_000u128) // $0.15 minimum (Scavenger Mode)
         } else {
-            U256::from(crate::constants::MIN_NET_PROFIT_USD_WEI) // $2.00 standard
+            U256::from(200_000_000_000_000u128) // $0.50 during high gas
         };
 
         if net_profit < min_threshold {

@@ -49,6 +49,10 @@ impl Discovery {
                 // Ye rasta bade bots kabhi scan nahi karte.
                 NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_DEGEN, token_1: constants::TOKEN_AERO, pair: alloy_primitives::address!("0x532f27101965dd16442E59d40670Fa5ad5f3fe91"), dex_name: DexName::BaseSwap }),
                 
+                // Alpha Cluster: VIRTUAL & Gaming Alpha (High Volatility)
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: alloy_primitives::address!("0x0bFbCF9fa4f9C56B0F40a671Ad40E0805A091865"), pair: alloy_primitives::address!("0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"), dex_name: DexName::PancakeSwap }),
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: alloy_primitives::address!("0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed"), pair: alloy_primitives::address!("0x3D2d7681335A74Be482D207137f814bA688849E8"), dex_name: DexName::UniswapV2 }), // AlienBase
+
                 // Gaming/Meme Alpha Bridge
                 NewPoolEvent::V2(V2PoolData { 
                     token_0: constants::TOKEN_WETH, 

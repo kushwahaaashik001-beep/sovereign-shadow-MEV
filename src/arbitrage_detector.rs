@@ -156,7 +156,7 @@ impl ArbitrageDetector {
                     SWAPS_RECEIVED.fetch_add(1, Ordering::Relaxed);
                     // Pillar Z: Update pool activity to keep graph "Hot"
                     if event.swap_info.token_in.is_zero() {
-                        // Event-based trigger (Back-running)
+                        // Back-running trigger: Immediate Hotness
                         self.pool_activity.insert(event.swap_info.router, std::time::Instant::now());
                     } else {
                         if let Some(pool) = self.get_pool_from_router(&event.swap_info.router, &event.swap_info.token_in, &event.swap_info.token_out) {
@@ -213,8 +213,23 @@ impl ArbitrageDetector {
         if event.swap_info.token_in.is_zero() {
             // Back-running trigger: Evaluate both directions of the pool using RAM state
             if let Some(reg) = self.pool_registry.get(&event.swap_info.router) {
+                let (t0, t1, dex) = *reg;
                 search_directions.push((reg.0, reg.1));
                 search_directions.push((reg.1, reg.0));
+                
+                // ALPHA CHAAL: Lagging Sibling Detection
+                // If a CORE pool syncs, immediately check if niche DEXs for the same tokens are lagging.
+                if dex == DexName::Aerodrome || dex == DexName::UniswapV3 {
+                    for sibling in self.pool_registry.iter() {
+                        let (s0, s1, s_dex) = *sibling.value();
+                        if s_dex != DexName::Aerodrome && s_dex != DexName::UniswapV3 {
+                            if (s0 == t0 || s1 == t0) || (s0 == t1 || s1 == t1) {
+                                // Mark sibling pool as "Hot" to force inclusion in next search
+                                self.pool_activity.insert(*sibling.key(), std::time::Instant::now());
+                            }
+                        }
+                    }
+                }
             }
         } else {
             // Front-running trigger: Evaluate specific swap direction
