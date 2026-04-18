@@ -72,6 +72,13 @@ impl WsProviderPool {
         (0, self.providers[0].clone())
     }
 
+    /// [HYDRA ROLE] Returns a specific head by index with fallback.
+    pub fn get_head(&self, index: usize) -> (usize, Arc<WsProvider>) {
+        let len = self.providers.len();
+        let target = index % len;
+        (target, self.providers[target].clone())
+    }
+
     pub fn mark_unhealthy(&self, provider_idx: usize, duration_secs: u64) {
         let resume_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + duration_secs;
         self.health[provider_idx].store(resume_at, Ordering::Relaxed);

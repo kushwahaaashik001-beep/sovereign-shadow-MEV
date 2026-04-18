@@ -145,13 +145,13 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     tokio::spawn(async move {
         telemetry::run_telemetry_loop(tele_rx).await;
     });
-
-    // Primary provider for setup (uses the first available key)
-    let ws_provider = ws_provider_pool.next().1;
+    
+    // Hydra Assignment: Head 0 for Setup and Heartbeat
+    let (_, ws_setup_provider) = ws_provider_pool.get_head(0);
     
     let executor_address = parse_address_robust(&env::var("EXECUTOR_ADDRESS").unwrap_or_default());
 
-    let chain_id = ws_provider.get_chain_id().await?;
+    let chain_id = ws_setup_provider.get_chain_id().await?;
     info!("🔗 Chain ID: {}", chain_id);
 
     let wallet = PrivateKeySigner::from_str(priv_key)?;
@@ -169,7 +169,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
         tokio::spawn(async move { scanner.run().await; });
     }
 
-    let nonce_manager = Arc::new(NonceManager::new(ws_provider.clone(), wallet.address()).await?);
+    let nonce_manager = Arc::new(NonceManager::new(ws_setup_provider.clone(), wallet.address()).await?);
 
     // Pillar E: Dynamic Relay Loading from Secrets
     let mut relays = vec![
@@ -212,7 +212,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
             ai_strategy: None,
             telemetry_tx: Some(tele_handle_for_loop),
         },
-        ws_provider.clone(),
+        ws_setup_provider.clone(),
         nonce_manager.clone(),
         circuit_breaker.clone(),
         state_simulator.clone(),
@@ -256,10 +256,10 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
         });
     }
 
-    let l1_calc = L1DataFeeCalculator::new(ws_provider.clone());
+    let l1_calc = L1DataFeeCalculator::new(ws_setup_provider.clone());
 
     let flash_executor = Arc::new(FlashLoanExecutor::new(
-        ws_provider.clone(),
+        ws_setup_provider.clone(),
         executor_address,
         U256::from(10u64.pow(14)),
         Some(bundle_builder.clone()),
@@ -281,7 +281,8 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
         let ws_pool = ws_provider_pool.clone();
         tokio::spawn(async move {
             loop {
-                let (_, ws_provider) = ws_pool.next();
+                // Role: WSS_BLOCKS (Head 0)
+                let (_, ws_provider) = ws_pool.get_head(0);
                 if let Ok(sub) = ws_provider.subscribe_blocks().await {
                     let mut stream = sub.into_stream();
                     while let Some(block) = stream.next().await {
@@ -303,7 +304,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     }
 
     let profit_manager = Arc::new(ProfitManager::new(
-        http_provider_pool.next().1,
+        http_provider_pool.get_head(2).1, // Role: HTTP_FLASHBOTS (Head 2)
         wallet.clone(),
         nonce_manager.clone(),
         l1_calc.clone(),
@@ -322,7 +323,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     }
 
     let inventory_manager = Arc::new(InventoryManager::new(
-        http_provider_pool.next().1,
+        http_provider_pool.get_head(3).1, // Role: HTTP_BACKUP (Head 3)
         wallet.clone(),
         executor_address,
         chain,
@@ -347,7 +348,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
 
     let (detector, mut opp_rx, _) = ArbitrageDetector::new(
         detector_config,
-        ws_provider.clone(),
+        ws_setup_provider.clone(),
         state_mirror.clone(),
         gas_feed.clone(),
         bidding_engine.clone(),
@@ -372,7 +373,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
             mirror.sync_all_pools_multicall_pooled(pool)
         );
 
-        let _ = ws_provider.get_block_number().await?;
+        let _ = ws_setup_provider.get_block_number().await?;
     }
     info!("✅ [PILLAR Q] Bootstrap Sequence Complete. System is STABLE.");
 
@@ -467,7 +468,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
             // Pillar L: Proactive Bytecode Warming for X-Ray Scanning
             // HTTP pool ka use karke WebSocket connections aur rate limits bacha rahe hain.
             let m = mirror_init.clone();
-            let p = http_pool_init.next().1;
+            let p = http_pool_init.get_head(1).1; // Role: HTTP_SIMULATE (Head 1)
             tokio::spawn(async move {
                 m.fetch_and_cache_bytecode(pool_addr, p).await;
             });
@@ -484,7 +485,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     // Pillar Z: Warm Start Discovery
     // Bug Fix: Must run warm_start before hunting to populate the pool graph
     {
-        let discovery = Discovery::new(ws_provider.clone(), pool_tx.clone(), chain);
+        let discovery = Discovery::new(ws_setup_provider.clone(), pool_tx.clone(), chain);
         info!("🔍 [PILLAR Z] Initializing Warm Start (Scanning historical liquidity)...");
         discovery.bootstrap_core_pools(); // Seeding happens while listeners are active
         discovery.warm_start().await;
@@ -511,7 +512,8 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
                 if sub_stream.is_none() || active_pools.len() > (current_sub_count + (current_sub_count / 10)) {
                     info!("🔄 [SHADOW-DEX] Updating Targeted Filter: {} pools", active_pools.len());
                     
-                    let (idx, provider) = ws_pool.next();
+                    // Role: WSS_LOGS (Head 1)
+                    let (idx, provider) = ws_pool.get_head(1);
                     
                     // Alchemy limit: Address list in filter cannot be infinite, 
                     // but 5,000-10,000 is usually fine for dedicated subs.

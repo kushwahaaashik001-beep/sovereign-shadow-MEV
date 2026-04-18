@@ -71,7 +71,8 @@ impl FactoryScanner {
             ]);
 
         loop {
-            let provider = self.ws_provider_pool.next();
+            // Role: WSS_FACTORY (Head 2)
+            let provider = self.ws_provider_pool.get_head(2);
             debug_assert!(provider.1.get_chain_id().await.is_ok());
 
             match provider.1.subscribe_logs(&filter.clone()).await {
