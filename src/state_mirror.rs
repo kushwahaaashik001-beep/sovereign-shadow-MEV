@@ -422,8 +422,9 @@ impl StateMirror {
             let block_age = if pool.last_updated_block == 0 { 0 } else { current.saturating_sub(pool.last_updated_block) };
             let time_since_access = now.saturating_sub(pool.last_access_ts);
             
-            // Heat criteria: Updated in last 5 blocks OR accessed in last 60s
-            let is_hot = block_age < 5 || time_since_access < 60;
+            // [SHADOW-DEX] Persistent RAM: Pruning ko relax kiya hai taaki discover kiye hue 5k pools RAM mein rahein.
+            // Updated in last 50 blocks OR accessed in last 5 minutes.
+            let is_hot = block_age < 50 || time_since_access < 300;
             let is_new = pool.last_updated_block == 0;
             
             is_hot || is_new

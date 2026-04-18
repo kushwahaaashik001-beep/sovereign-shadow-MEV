@@ -484,9 +484,12 @@ impl ArbitrageDetector {
                     is_core || (liq_usd >= 1000 && liq_usd <= constants::MAX_ALPHA_LIQUIDITY_USD) // Catch $1k+ liquidity pools
                 };
 
-                // Predator Filter: Skip congested pools during graph rebuild to avoid high-competition paths
-                if self.state_mirror.is_congested(pool_addr, 5) {
-                    continue;
+                // [GHOST-MODE] Anti-Competition Trainer:
+                // Agar kisi pool par 2 se zyada bots/traders active hain, toh hum use chhod denge.
+                // Big bots usually 5-10 bots se ladte hain. Hum sirf un paths par jayenge jahan 0-1 bot hai.
+                let comp_score = self.state_mirror.get_competition_score(pool_addr);
+                if comp_score > 2 && !is_core {
+                    continue; 
                 }
 
                 // Alpha Hunter Logic:
