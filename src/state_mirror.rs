@@ -328,7 +328,7 @@ impl StateMirror {
             // "Slow Hydration" Logic: Add 200ms delay between chunks to stay under CU/sec limits
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
             
-            let provider = pool.next(); 
+            let (idx, provider) = pool.next(); 
             let multicall = IMulticall3::IMulticall3Instance::new(multicall_addr, provider);
             
             let mut calls = Vec::with_capacity(chunk.len() * 2);
@@ -384,7 +384,12 @@ impl StateMirror {
                         _ => {}
                     }
                 }
-                self.batch_update_reserves(updates);
+                if updates.is_empty() && !chunk.is_empty() {
+                    // Possible rate limit on multicall
+                    pool.mark_unhealthy(idx, 30);
+                } else {
+                    self.batch_update_reserves(updates);
+                }
             }
         }
         

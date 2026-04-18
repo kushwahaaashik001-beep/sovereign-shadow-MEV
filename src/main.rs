@@ -110,34 +110,33 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     let relay_key_raw = env::var("RELAY_SIGNING_KEY").expect("🚀 Needs RELAY_SIGNING_KEY for MEV-Blocker identity");
     let relay_key = relay_key_raw.trim().trim_start_matches("0x");
 
-    // Initialize WSS Provider Pool for parallel listening
-    let provider_futures = wss_urls.iter().map(|url| {
-        let url = url.clone();
-        async move {
-            let ws = WsConnect::new(url.clone());
-            match ProviderBuilder::new().on_ws(ws).await {
-                Ok(p) => Some(Arc::new(p.boxed())),
-                Err(e) => { error!("❌ [INFRA] Connection failed {}: {}", url, e); None }
+    // [GOD-LEVEL] Provider Filtering: Sirf wahi keys use hongi jo actually kaam kar rahi hain.
+    let mut working_wss = Vec::new();
+    let mut working_ws_providers = Vec::new();
+    for url in wss_urls {
+        let ws = WsConnect::new(url.clone());
+        if let Ok(p) = tokio::time::timeout(Duration::from_secs(5), ProviderBuilder::new().on_ws(ws)).await {
+            if let Ok(prov) = p {
+                working_ws_providers.push(Arc::new(prov.boxed()));
+                working_wss.push(url);
             }
         }
-    });
-    let ws_providers: Vec<Arc<the_sovereign_shadow::WsProvider>> = futures::future::join_all(provider_futures).await.into_iter().flatten().collect();
+    }
 
-    if ws_providers.is_empty() { return Err("No valid WSS endpoints".into()); }
-    let ws_provider_pool = Arc::new(WsProviderPool::new(ws_providers));
+    if working_ws_providers.is_empty() { return Err("No valid WSS endpoints found".into()); }
+    let ws_provider_pool = Arc::new(WsProviderPool::new(working_ws_providers));
     
-    // Initialize HTTP Provider Pool for distributed state reads
-    let http_provider_futures = http_urls.iter().map(|url| {
-        let url = url.clone();
-        async move {
-            match ProviderBuilder::new().on_http(url.parse().ok()?) {
-                p => Some(Arc::new(p.boxed())),
-            }
+    let mut working_http = Vec::new();
+    let mut working_http_providers = Vec::new();
+    for url in http_urls {
+        if let Ok(parsed_url) = url.parse() {
+            let prov = ProviderBuilder::new().on_http(parsed_url);
+            working_http_providers.push(Arc::new(prov.boxed()));
+            working_http.push(url);
         }
-    });
-    let http_providers: Vec<Arc<the_sovereign_shadow::WsProvider>> = futures::future::join_all(http_provider_futures).await.into_iter().flatten().collect();
-    if http_providers.is_empty() { return Err("No valid HTTP endpoints".into()); }
-    let http_provider_pool = Arc::new(WsProviderPool::new(http_providers));
+    }
+    if working_http_providers.is_empty() { return Err("No valid HTTP endpoints found".into()); }
+    let http_provider_pool = Arc::new(WsProviderPool::new(working_http_providers));
 
     // Initialize Telemetry Nervous System
     let (tele_tx, tele_rx) = mpsc::unbounded_channel();
@@ -148,7 +147,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     });
 
     // Primary provider for setup (uses the first available key)
-    let ws_provider = ws_provider_pool.next();
+    let ws_provider = ws_provider_pool.next().1;
     
     let executor_address = parse_address_robust(&env::var("EXECUTOR_ADDRESS").unwrap_or_default());
 
@@ -282,8 +281,8 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
         let ws_pool = ws_provider_pool.clone();
         tokio::spawn(async move {
             loop {
-                let provider = ws_pool.next();
-                if let Ok(sub) = provider.subscribe_blocks().await {
+                let (_, ws_provider) = ws_pool.next();
+                if let Ok(sub) = ws_provider.subscribe_blocks().await {
                     let mut stream = sub.into_stream();
                     while let Some(block) = stream.next().await {
                         let block_number = block.header.number;
@@ -304,7 +303,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     }
 
     let profit_manager = Arc::new(ProfitManager::new(
-        http_provider_pool.next(),
+        http_provider_pool.next().1,
         wallet.clone(),
         nonce_manager.clone(),
         l1_calc.clone(),
@@ -323,7 +322,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     }
 
     let inventory_manager = Arc::new(InventoryManager::new(
-        http_provider_pool.next(),
+        http_provider_pool.next().1,
         wallet.clone(),
         executor_address,
         chain,
@@ -346,7 +345,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     detector_config.scanner_threads = 16;
     detector_config.min_profit_wei = U256::from(10u64.pow(13));
 
-    let (detector, mut opp_rx, force_tx) = ArbitrageDetector::new(
+    let (detector, mut opp_rx, _) = ArbitrageDetector::new(
         detector_config,
         ws_provider.clone(),
         state_mirror.clone(),
@@ -399,7 +398,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
 
     let (mempool_listener, mut mempool_rx, _priority_rx) = MempoolListener::new(
         MempoolListenerConfig {
-            endpoints: wss_urls,
+            endpoints: working_wss, // ONLY WORKING KEYS
             chain,
             min_gas_price_gwei: 0,
             ..Default::default()
@@ -468,7 +467,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
             // Pillar L: Proactive Bytecode Warming for X-Ray Scanning
             // HTTP pool ka use karke WebSocket connections aur rate limits bacha rahe hain.
             let m = mirror_init.clone();
-            let p = http_pool_init.next();
+            let p = http_pool_init.next().1;
             tokio::spawn(async move {
                 m.fetch_and_cache_bytecode(pool_addr, p).await;
             });
@@ -494,7 +493,6 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     // Pillar S: Real-time State Mirror Syncing (The Lifeblood)
     {
         let mirror = state_mirror.clone();
-        let f_tx = force_tx.clone();
 
         // Pillar S: Pre-compute topics to avoid string parsing in the hot loop
         let v2_sync_topic = alloy_primitives::fixed_bytes!("0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
@@ -513,7 +511,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
                 if sub_stream.is_none() || active_pools.len() > (current_sub_count + (current_sub_count / 10)) {
                     info!("🔄 [SHADOW-DEX] Updating Targeted Filter: {} pools", active_pools.len());
                     
-                    let provider = ws_pool.next();
+                    let (idx, provider) = ws_pool.next();
                     
                     // Alchemy limit: Address list in filter cannot be infinite, 
                     // but 5,000-10,000 is usually fine for dedicated subs.
@@ -529,6 +527,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
                         }
                         Err(e) => {
                             error!("❌ [SHADOW-DEX] Sub failed: {}. Retrying with next key...", e);
+                            ws_pool.mark_unhealthy(idx, 60);
                             tokio::time::sleep(Duration::from_secs(5)).await;
                             continue;
                         }
@@ -552,7 +551,8 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
                             }
-                            let _ = f_tx.send(());
+                            // [PERFORMANCE FIX] REMOVED f_tx.send(()) 
+                            // Rebuilding the graph on every price update is redundant and causes lag.
                         }
                         _ = tokio::time::sleep(Duration::from_secs(30)) => {
                             // Check for new pools discovered in the last 30s

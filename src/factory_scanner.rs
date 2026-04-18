@@ -72,9 +72,9 @@ impl FactoryScanner {
 
         loop {
             let provider = self.ws_provider_pool.next();
-            debug_assert!(provider.get_chain_id().await.is_ok());
+            debug_assert!(provider.1.get_chain_id().await.is_ok());
 
-            match provider.subscribe_logs(&filter.clone()).await {
+            match provider.1.subscribe_logs(&filter.clone()).await {
                 Ok(sub) => {
                     info!("📡 [Factory Scanner] Subscribed to new pool logs");
                     let mut stream = sub.into_stream();

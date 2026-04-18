@@ -113,7 +113,10 @@ impl FlashLoanExecutor {
         // Static analysis must happen before dynamic simulation for 100% coverage.
         // HTTP pool ka use karke rapid fire honeypot checks kar rahe hain.
         let mut fetch_tasks = Vec::with_capacity(opp.path.hops.len() * 2);
-        let fetch_provider = self.http_pool.as_ref().map(|p| p.next()).unwrap_or_else(|| self.provider.clone());
+        let fetch_provider_tuple = self.http_pool.as_ref().map(|p| p.next())
+            .unwrap_or_else(|| (0, self.provider.clone()));
+        let fetch_provider = fetch_provider_tuple.1;
+
         for hop in &opp.path.hops {
             fetch_tasks.push(self.state_simulator.mirror.fetch_and_cache_bytecode(hop.token_out, fetch_provider.clone()));
             fetch_tasks.push(self.state_simulator.mirror.fetch_and_cache_bytecode(hop.pool_address, fetch_provider.clone()));

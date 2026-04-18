@@ -26,7 +26,8 @@ impl GasPriceFeed {
 
         tokio::spawn(async move {
             loop {
-                let ws_provider = pool.next();
+                let ws_provider_tuple = pool.next();
+                let ws_provider = ws_provider_tuple.1;
                 if let Ok(sub) = ws_provider.subscribe_blocks().await {
                     let mut stream = sub.into_stream();
                     while let Some(block) = stream.next().await {

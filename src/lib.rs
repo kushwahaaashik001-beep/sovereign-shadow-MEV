@@ -49,8 +49,8 @@ impl WsProviderPool {
         Self { providers, next: AtomicUsize::new(0), health, usage_stats: usage }
     }
 
-    /// [HYDRA LOGIC] Har call par agla healthy provider return karta hai aur usage track karta hai.
-    pub fn next(&self) -> Arc<WsProvider> {
+    /// [HYDRA LOGIC] Returns (index, provider) to allow marking specific heads as unhealthy.
+    pub fn next(&self) -> (usize, Arc<WsProvider>) {
         let len = self.providers.len();
         if len == 0 { panic!("No providers in pool"); }
 
@@ -64,12 +64,12 @@ impl WsProviderPool {
             // Check if this Hydra head is healthy (cooldown check)
             if self.health[idx].load(Ordering::Relaxed) <= now {
                 self.usage_stats[idx].fetch_add(1, Ordering::Relaxed);
-                return self.providers[idx].clone();
+                return (idx, self.providers[idx].clone());
             }
         }
 
         // If all are blocked, return the least-blocked one
-        self.providers[0].clone()
+        (0, self.providers[0].clone())
     }
 
     pub fn mark_unhealthy(&self, provider_idx: usize, duration_secs: u64) {
