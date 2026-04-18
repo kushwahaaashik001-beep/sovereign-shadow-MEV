@@ -421,7 +421,7 @@ impl StateMirror {
             
             let block_age = if pool.last_updated_block == 0 { 0 } else { current.saturating_sub(pool.last_updated_block) };
             let time_since_access = now.saturating_sub(pool.last_access_ts);
-            
+
             // [SHADOW-DEX] Persistent RAM: Pruning ko relax kiya hai taaki discover kiye hue 5k pools RAM mein rahein.
             // Updated in last 50 blocks OR accessed in last 5 minutes.
             let is_hot = block_age < 500 || time_since_access < 1800; // Keep for 30 mins

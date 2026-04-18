@@ -74,11 +74,12 @@ impl Discovery {
         info!("🕯️ [PILLAR Z] Warm Start: Scanning historical logs for existing pools...");
         
         let pool_tx = self.pool_tx.clone();
-        let pool = self.http_pool.clone();
+        let http_pool_for_discovery = self.http_pool.clone();
         
         // Background task to prevent blocking the main engine startup
         tokio::spawn(async move {
-            let (_, provider) = pool.get_head(0);
+            let (_, provider) = http_pool_for_discovery.get_head(0);
+            // Explicitly define type to help compiler inference
             let current_block = provider.get_block_number().await.unwrap_or_default();
             // [DEEP-DISCOVERY] Scan last 5,000 blocks in batches of 500 to respect Alchemy limits.
             let lookback = 5000;
@@ -90,7 +91,7 @@ impl Discovery {
 
             let mut total_discovered = 0;
             while start_block < current_block {
-                let (idx, provider) = pool.next(); 
+                let (idx, provider) = http_pool_for_discovery.next(); // Rotate key for every batch
                 let end_batch = (start_block + 200).min(current_block); // Smaller batches
                 let filter = Filter::new()
                     .from_block(start_block)
@@ -108,7 +109,7 @@ impl Discovery {
                         start_block = end_batch + 1;
                     }
                     Err(_) => {
-                        pool.mark_unhealthy(idx, 10);
+                        http_pool_for_discovery.mark_unhealthy(idx, 10);
                         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                     }
                 }

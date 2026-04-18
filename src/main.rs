@@ -236,23 +236,11 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
             }
         });
 
-        // Pillar B: Reactive State Guard (0% Rate Limit Logic)
-        // We only sync via Multicall ONCE at boot and then if a GAP is detected.
-        let mirror_sync = state_mirror.clone();
-        let http_pool_sync = Arc::clone(&http_provider_pool);
+        // [ZERO-POLLING] Batch Loading via HTTP_SYNC (Head 0)
+        let mirror_boot = state_mirror.clone();
+        let sync_pool = http_provider_pool.clone();
         tokio::spawn(async move {
-            // Initial sync with full pool rotation to avoid hitting any single key
-            let _ = mirror_sync.sync_all_pools_multicall_pooled(http_pool_sync.clone()).await;
-            
-            let mut interval = tokio::time::interval(Duration::from_secs(60)); 
-            loop {
-                interval.tick().await;
-                // Only sync via HTTP if dirty AND it's been a while (throttle to 5 mins)
-                if mirror_sync.dirty_flag.load(Ordering::Acquire) && 
-                   (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - mirror_sync.last_multicall_sync.load(Ordering::Acquire) > 300) {
-                    let _ = mirror_sync.sync_all_pools_multicall_pooled(http_pool_sync.clone()).await;
-                }
-            }
+            let _ = mirror_boot.sync_all_pools_multicall_pooled(sync_pool).await;
         });
     }
 
@@ -409,8 +397,9 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
         None,
     ).await?;
 
+    let mirror_for_run = state_mirror.clone();
     tokio::spawn(async move {
-        if let Err(e) = mempool_listener.run().await {
+        if let Err(e) = mempool_listener.run(mirror_for_run).await {
             error!("❌ Mempool Listener crashed: {:?}", e);
         }
     });
@@ -487,7 +476,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     // Pillar Z: Warm Start Discovery
     // Bug Fix: Must run warm_start before hunting to populate the pool graph
     {
-        let discovery = Discovery::new(http_provider_pool.clone(), pool_tx.clone(), chain);
+        let discovery = Discovery::new(http_provider_pool.clone(), pool_tx.clone(), chain); // Use HTTP_SYNC (Head 0) for discovery
         info!("🔍 [PILLAR Z] Initializing Warm Start (Scanning historical liquidity)...");
         discovery.bootstrap_core_pools(); // Seeding happens while listeners are active
         discovery.warm_start().await;

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{info, warn};
+use crate::state_mirror::StateMirror;
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -96,7 +97,7 @@ impl MempoolListener {
         ))
     }
 
-    pub async fn run(self) -> Result<(), ListenerError> {
+    pub async fn run(self, mirror: Arc<StateMirror>) -> Result<(), ListenerError> {
         info!("📡 [BLOCK-WATCH] Disabling Mempool Snipe. Shifting to Event-Based Architecture (Zero Rate Limit)");
         info!("🥷 Mode: Back-running (Post-Swap Arbitrage)");
         
@@ -121,6 +122,9 @@ impl MempoolListener {
                     if let Ok(logs) = log_sub {
                         let mut log_stream = logs.into_stream();
                         while let Some(log) = log_stream.next().await {
+                            // [ZERO-POLLING] Update RAM State directly from the log
+                            Self::update_mirror_state(&log, &mirror);
+                            // Then trigger detection
                             Self::process_log_event(&log, &event_tx, &seen_hashes_ws);
                         }
                     }
@@ -129,6 +133,26 @@ impl MempoolListener {
             }
             // Exponential backoff or simple delay
             tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+
+    fn update_mirror_state(log: &Log, mirror: &StateMirror) {
+        let v2_sync_topic = fixed_bytes!("1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
+        let v3_swap_topic = fixed_bytes!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
+        
+        let pool_addr = log.address();
+        if let Some(topic0) = log.topics().first() {
+            if *topic0 == v2_sync_topic {
+                if log.data().data.len() >= 64 {
+                    let r0 = U256::from_be_slice(&log.data().data[0..32]);
+                    let r1 = U256::from_be_slice(&log.data().data[32..64]);
+                    mirror.update_v2_reserves(pool_addr, r0, r1);
+                }
+            } else if *topic0 == v3_swap_topic {
+                if let Some(state) = crate::v3_math::decode_v3_swap_log(log) {
+                    mirror.update_v3_state(pool_addr, state.sqrt_price, state.tick, state.liquidity);
+                }
+            }
         }
     }
 
