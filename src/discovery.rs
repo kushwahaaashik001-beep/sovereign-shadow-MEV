@@ -5,7 +5,7 @@ use alloy::rpc::types::Filter;
 use alloy_primitives::B256;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tracing::info;
 use crate::factory_scanner::{NewPoolEvent, V2PoolData};
 use crate::models::{Chain, DexName};
 use crate::constants;
@@ -80,79 +80,58 @@ impl Discovery {
         // Background task to prevent blocking the main engine startup
         tokio::spawn(async move {
             let current_block = provider.get_block_number().await.unwrap_or_default();
-            // Alpha Hunter Look-Back: Reduced to 10 blocks for Alchemy Free tier compatibility.
-            // Higher plans allow 100+ blocks.
-            let start_block = current_block.saturating_sub(10); 
+            // [DEEP-DISCOVERY] Scan last 5,000 blocks in batches of 500 to respect Alchemy limits.
+            let lookback = 5000;
+            let mut start_block = current_block.saturating_sub(lookback);
 
             let v2_topic = B256::from(constants::EVENT_V2_PAIR_CREATED);
             let v3_topic = B256::from(constants::EVENT_V3_POOL_CREATED);
             let aero_topic = alloy_primitives::fixed_bytes!("0x212847ad1f2f1ad0d76077f4a7f5f3e728cc2ac818eb64fed8004e115fbcca67");
-            
-            // Single RPC call for 10,000 blocks range as requested to stay under rate limits
-            let filter = Filter::new()
-                .from_block(start_block)
-                .to_block(current_block)
-                .event_signature(vec![v2_topic, v3_topic, aero_topic]);
 
-            match provider.get_logs(&filter).await {
-                Err(ref e) if e.to_string().contains("-32600") => {
-                    // Alchemy specific fallback: range is too wide for free tier
-                    warn!("⚠️ [ALPHA-LOOKBACK] Range too wide for Free RPC. Discovery restricted to bootstrap pools.");
-                }
-                Ok(logs) => {
-                    let mut count = 0;
+            let mut total_discovered = 0;
+            while start_block < current_block {
+                let end_batch = (start_block + 500).min(current_block);
+                let filter = Filter::new()
+                    .from_block(start_block)
+                    .to_block(end_batch)
+                    .event_signature(vec![v2_topic, v3_topic, aero_topic]);
+
+                if let Ok(logs) = provider.get_logs(&filter).await {
                     for log in logs {
-                        let data = log.data().data.as_ref();
-                        let topics = log.topics();
-                        if topics.is_empty() { continue; }
-                        
-                        let topic0 = topics[0];
-                        
-                        if topic0 == v2_topic && topics.len() >= 3 {
-                            let token0 = Address::from_word(topics[1]);
-                            let token1 = Address::from_word(topics[2]);
-                            if data.len() >= 32 {
-                                let pair = Address::from_slice(&data[12..32]);
-                                let _ = pool_tx.send(NewPoolEvent::V2(V2PoolData { 
-                                    token_0: token0, token_1: token1, pair, dex_name: DexName::UniswapV2 
-                                }));
-                                count += 1;
-                            }
-                        } else if topic0 == v3_topic && topics.len() >= 3 {
-                            let token0 = Address::from_word(topics[1]);
-                            let token1 = Address::from_word(topics[2]);
-                            if data.len() >= 64 {
-                                let pool = Address::from_slice(&data[44..64]);
-                                let _ = pool_tx.send(NewPoolEvent::V3(crate::factory_scanner::V3PoolData {
-                                    pool, token_0: token0, token_1: token1, fee: 0, dex_name: DexName::UniswapV3
-                                }));
-                                count += 1;
-                            }
-                        } else if topic0 == aero_topic && topics.len() >= 3 {
-                            let token0 = Address::from_word(topics[1]);
-                            let token1 = Address::from_word(topics[2]);
-                            if data.len() >= 32 {
-                                let pool = Address::from_slice(&data[12..32]);
-                                let _ = pool_tx.send(NewPoolEvent::V2(V2PoolData { 
-                                    pair: pool, token_0: token0, token_1: token1, dex_name: DexName::Aerodrome 
-                                }));
-                                count += 1;
-                            }
+                        if let Some(event) = Self::parse_historical_log(&log, v2_topic, v3_topic, aero_topic) {
+                            let _ = pool_tx.send(event);
+                            total_discovered += 1;
                         }
                     }
-                    if count > 0 { info!("✅ [ALPHA-LOOKBACK] Seeding complete. Injected {} historical pools.", count); }
                 }
-                Err(e) => {
-                    let err_msg = e.to_string();
-                    // Handle Archive Plan limitation gracefully
-                    if err_msg.contains("-32002") || err_msg.contains("Archive") || err_msg.contains("limit") {
-                        warn!("⚠️ [ALPHA-LOOKBACK] Historical scan restricted by RPC plan (Chainstack/Quicknode). Discovery will rely on bootstrap pools and real-time logs.");
-                    } else {
-                        error!("❌ [ALPHA-LOOKBACK] Historical scan failed: {}", err_msg);
-                    }
-                }
+                start_block = end_batch + 1;
+                // Anti-RateLimit: 200ms delay between batches
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
-            info!("🏁 [PILLAR Z] Warm Start process complete.");
+            info!("🏁 [PILLAR Z] Warm Start complete. Discovered {} historical pools.", total_discovered);
         });
+    }
+
+    fn parse_historical_log(log: &alloy::rpc::types::Log, v2: B256, v3: B256, aero: B256) -> Option<NewPoolEvent> {
+        let topics = log.topics();
+        if topics.is_empty() { return None; }
+        let data = log.data().data.as_ref();
+
+        if topics[0] == v2 && topics.len() >= 3 && data.len() >= 32 {
+            Some(NewPoolEvent::V2(V2PoolData { 
+                token_0: Address::from_word(topics[1]), token_1: Address::from_word(topics[2]), 
+                pair: Address::from_slice(&data[12..32]), dex_name: DexName::UniswapV2 
+            }))
+        } else if topics[0] == v3 && topics.len() >= 3 && data.len() >= 64 {
+            Some(NewPoolEvent::V3(crate::factory_scanner::V3PoolData {
+                pool: Address::from_slice(&data[44..64]), token_0: Address::from_word(topics[1]), 
+                token_1: Address::from_word(topics[2]), fee: 0, dex_name: DexName::UniswapV3
+            }))
+        } else if topics[0] == aero && topics.len() >= 3 && data.len() >= 32 {
+            Some(NewPoolEvent::V2(V2PoolData { 
+                token_0: Address::from_word(topics[1]), token_1: Address::from_word(topics[2]), 
+                pair: Address::from_slice(&data[12..32]), dex_name: DexName::Aerodrome 
+            }))
+        } else { None }
     }
 }
