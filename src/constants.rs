@@ -64,20 +64,26 @@ pub static TOP_100_POOLS: Lazy<FxHashSet<Address>> = Lazy::new(|| {
     // 1. Core Bridges (Zaruri hain rasta banaye rakhne ke liye)
     set.insert(addr!("0xcDAC0d6c6C59727a65F871236188350531885C43")); // Aero WETH/USDC
     set.insert(addr!("0xd0b53D9277642d899DF5C87A3966A349A798F224")); // UniV3 WETH/USDC (0.05%)
+    set.insert(addr!("0x4C36388bE6F416A29C8d8Eee819bb35ed3737a01")); // UniV3 WETH/USDC (0.3%)
+    set.insert(addr!("0x21943f679eD5f05329883584860D49C039237685")); // Sushi WETH/USDC
+    set.insert(addr!("0x7E3411B04766089cFaa52DB688855356A12f05D1")); // BaseSwap WETH/USDC
     
     // 2. Alpha Cluster: DEGEN (Base ka king meme)
     set.insert(addr!("0xc9034c3E7242654fd148e934814510d0e9436db4")); // UniV2 WETH/DEGEN
     set.insert(addr!("0x4b0Aaf3EBb163dd45F663b38b6d93f6093EBC2d3")); // UniV2 USDC/DEGEN
     set.insert(addr!("0x3062ad446da2cfdb10266e06bee30f33ba2a6b41")); // Aero DEGEN/WETH
+    set.insert(addr!("0xf0c57173e35181D061033A38166D5726C4A641F2")); // Pancake DEGEN/WETH
 
     // 3. Alpha Cluster: AERO & Ecosystem
     set.insert(addr!("0x7f670f78B17dEC44d5Ef68a48740b6f8849cc2e6")); // Aero WETH/AERO
     set.insert(addr!("0x532f27101965dd16442E59d40670Fa5ad5f3fe91")); // Aero WETH/BRETT
     set.insert(addr!("0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22")); // cbETH/WETH (Price lags often)
+    set.insert(addr!("0x420DD381b31aEf6683db6B902084c0BAc2D1b5d5")); // Aero WETH/USDT
 
-    // 4. Alpha Cluster: Mid-Cap Memes (Low competition, High arb potential)
+    // 4. Alpha Cluster: VIRTUAL & AI Agents
     set.insert(addr!("0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865")); // Pancake WETH/MemeX
-    set.insert(addr!("0xFDa619b6d20975be8074d3315450bbBA58456B12")); // BaseSwap WETH/Virtual
+    set.insert(addr!("0x0bFbCF9fa4f9C56B0F40a671Ad40E0805A091865")); // Virtual/WETH
+    set.insert(addr!("0x30c90069678174577B0Ac49969D7070F7915B597")); // AI16Z/WETH
     
     // 5. Alpha Cluster: The Scavenger Network (Targeting $20-$30/day)
     set.insert(addr!("0x04C9F118A4864700721A163744021d21DB27c11f")); // SwapBased Meme Pair

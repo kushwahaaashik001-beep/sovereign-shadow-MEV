@@ -87,8 +87,8 @@ impl FactoryScanner {
                     }
                 }
                 Err(e) => {
-                    error!("❌ Factory Scanner subscription failed: {}. Retrying in 5s...", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    error!("❌ Factory Scanner failure: {}. Cooldown 30s...", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 }
             }
         }

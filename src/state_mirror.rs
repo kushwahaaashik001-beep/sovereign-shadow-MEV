@@ -424,7 +424,7 @@ impl StateMirror {
             
             // [SHADOW-DEX] Persistent RAM: Pruning ko relax kiya hai taaki discover kiye hue 5k pools RAM mein rahein.
             // Updated in last 50 blocks OR accessed in last 5 minutes.
-            let is_hot = block_age < 50 || time_since_access < 300;
+            let is_hot = block_age < 500 || time_since_access < 1800; // Keep for 30 mins
             let is_new = pool.last_updated_block == 0;
             
             is_hot || is_new

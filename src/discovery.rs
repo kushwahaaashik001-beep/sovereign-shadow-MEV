@@ -90,24 +90,29 @@ impl Discovery {
 
             let mut total_discovered = 0;
             while start_block < current_block {
-                let (_, provider) = pool.next(); // Rotate key for every batch
-                let end_batch = (start_block + 500).min(current_block);
+                let (idx, provider) = pool.next(); 
+                let end_batch = (start_block + 200).min(current_block); // Smaller batches
                 let filter = Filter::new()
                     .from_block(start_block)
                     .to_block(end_batch)
                     .event_signature(vec![v2_topic, v3_topic, aero_topic]);
 
-                if let Ok(logs) = provider.get_logs(&filter).await {
-                    for log in logs {
-                        if let Some(event) = Self::parse_historical_log(&log, v2_topic, v3_topic, aero_topic) {
-                            let _ = pool_tx.send(event);
-                            total_discovered += 1;
+                match provider.get_logs(&filter).await {
+                    Ok(logs) => {
+                        for log in logs {
+                            if let Some(event) = Self::parse_historical_log(&log, v2_topic, v3_topic, aero_topic) {
+                                let _ = pool_tx.send(event);
+                                total_discovered += 1;
+                            }
                         }
+                        start_block = end_batch + 1;
+                    }
+                    Err(_) => {
+                        pool.mark_unhealthy(idx, 10);
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                     }
                 }
-                start_block = end_batch + 1;
-                // Anti-RateLimit: 200ms delay between batches
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             info!("🏁 [PILLAR Z] Warm Start complete. Discovered {} historical pools.", total_discovered);
         });
