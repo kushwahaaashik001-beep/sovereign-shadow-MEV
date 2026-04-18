@@ -397,9 +397,11 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
         });
     }
 
+    // Role: WSS_LOGS (Head 1)
+    let log_endpoint = working_wss.get(1).cloned().unwrap_or_else(|| working_wss[0].clone());
     let (mempool_listener, mut mempool_rx, _priority_rx) = MempoolListener::new(
         MempoolListenerConfig {
-            endpoints: working_wss, // ONLY WORKING KEYS
+            endpoints: vec![log_endpoint], 
             chain,
             min_gas_price_gwei: 0,
             ..Default::default()
@@ -485,7 +487,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     // Pillar Z: Warm Start Discovery
     // Bug Fix: Must run warm_start before hunting to populate the pool graph
     {
-        let discovery = Discovery::new(ws_setup_provider.clone(), pool_tx.clone(), chain);
+        let discovery = Discovery::new(http_provider_pool.clone(), pool_tx.clone(), chain);
         info!("🔍 [PILLAR Z] Initializing Warm Start (Scanning historical liquidity)...");
         discovery.bootstrap_core_pools(); // Seeding happens while listeners are active
         discovery.warm_start().await;

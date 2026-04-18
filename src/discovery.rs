@@ -1,5 +1,4 @@
-use alloy::providers::{RootProvider, Provider};
-use alloy::transports::BoxTransport;
+use alloy::providers::Provider;
 use alloy_primitives::Address;
 use alloy::rpc::types::Filter;
 use alloy_primitives::B256;
@@ -12,14 +11,14 @@ use crate::constants;
 
 /// Pillar Z: Historical pool discovery via log scanning (Warm Start).
 pub struct Discovery {
-    provider: Arc<RootProvider<BoxTransport>>,
+    http_pool: Arc<crate::WsProviderPool>, // Use pool instead of single provider
     pool_tx: broadcast::Sender<NewPoolEvent>,
     chain: Chain,
 }
 
 impl Discovery {
-    pub fn new(provider: Arc<RootProvider<BoxTransport>>, pool_tx: broadcast::Sender<NewPoolEvent>, chain: Chain) -> Self {
-        Self { provider, pool_tx, chain }
+    pub fn new(http_pool: Arc<crate::WsProviderPool>, pool_tx: broadcast::Sender<NewPoolEvent>, chain: Chain) -> Self {
+        Self { http_pool, pool_tx, chain }
     }
 
     /// Pillar Z: Pre-seed registry with core liquid pairs to ensure immediate readiness.
@@ -75,10 +74,11 @@ impl Discovery {
         info!("🕯️ [PILLAR Z] Warm Start: Scanning historical logs for existing pools...");
         
         let pool_tx = self.pool_tx.clone();
-        let provider = self.provider.clone();
+        let pool = self.http_pool.clone();
         
         // Background task to prevent blocking the main engine startup
         tokio::spawn(async move {
+            let (_, provider) = pool.get_head(0);
             let current_block = provider.get_block_number().await.unwrap_or_default();
             // [DEEP-DISCOVERY] Scan last 5,000 blocks in batches of 500 to respect Alchemy limits.
             let lookback = 5000;
@@ -90,6 +90,7 @@ impl Discovery {
 
             let mut total_discovered = 0;
             while start_block < current_block {
+                let (_, provider) = pool.next(); // Rotate key for every batch
                 let end_batch = (start_block + 500).min(current_block);
                 let filter = Filter::new()
                     .from_block(start_block)

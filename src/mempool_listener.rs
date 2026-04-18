@@ -100,64 +100,36 @@ impl MempoolListener {
         info!("📡 [BLOCK-WATCH] Disabling Mempool Snipe. Shifting to Event-Based Architecture (Zero Rate Limit)");
         info!("🥷 Mode: Back-running (Post-Swap Arbitrage)");
         
-        let mut tasks = Vec::new();
+        // [STRICT-ISOLATION] Use only the primary log endpoint assigned to this listener
+        let endpoint = self.config.endpoints.get(0).ok_or(ListenerError::NoEndpoints)?.clone();
+        let event_tx = self.event_tx.clone();
+        let seen_hashes_ws = self.seen_hashes.clone();
 
-        for endpoint in &self.config.endpoints {
-            let endpoint = endpoint.clone();
-            let event_tx = self.event_tx.clone();
-            let seen_hashes_ws = self.seen_hashes.clone();
+        loop {
+            let ws = WsConnect::new(endpoint.clone());
+            match ProviderBuilder::new().on_ws(ws).await {
+                Ok(provider) => {
+                    info!("✅ [EVENT-WATCH] Connected to Targeted Log Stream: {}", endpoint);
+                    
+                    // V2/V3/Aero Topics
+                    let v2_sync = fixed_bytes!("1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
+                    let v3_swap = fixed_bytes!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
+                    
+                    let filter = Filter::new().event_signature(vec![v2_sync, v3_swap]);
+                    let log_sub = provider.subscribe_logs(&filter).await;
 
-            tasks.push(tokio::spawn(async move {
-                loop {
-                    let ws = WsConnect::new(endpoint.clone());
-                    match ProviderBuilder::new().on_ws(ws).await {
-                        Ok(provider) => {
-                            info!("✅ [EVENT-WATCH] Connected to WSS: {}", endpoint);
-                            
-                            // 1. Subscribe to New Blocks (Back-running pulse)
-                            let block_sub = provider.subscribe_blocks().await;
-                            
-                            // 2. Subscribe to Sync Events (Uniswap V2 / Aerodrome / BaseSwap)
-                            // Topic: Sync(uint112 reserve0, uint112 reserve1)
-                            let v2_sync = fixed_bytes!("1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
-                            // V3 Swap Topic: Swap(address,address,int256,int256,uint160,uint128,int24)
-                            let v3_swap = fixed_bytes!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
-                            
-                            let filter = Filter::new().event_signature(vec![v2_sync, v3_swap]);
-                            let log_sub = provider.subscribe_logs(&filter).await;
-
-                            if let (Ok(blocks), Ok(logs)) = (block_sub, log_sub) {
-                                let mut block_stream = blocks.into_stream();
-                                let mut log_stream = logs.into_stream();
-
-                                loop {
-                                    tokio::select! {
-                                        Some(block) = block_stream.next() => {
-                                            info!("📦 [NEW BLOCK] #{} | Analyzing for back-run gaps...", 
-                                                block.header.number);
-                                        }
-                                        Some(log) = log_stream.next() => {
-                                            // Treat Sync events as immediate triggers
-                                            Self::process_log_event(&log, &event_tx, &seen_hashes_ws);
-                                        }
-                                        else => break,
-                                    }
-                                }
-                            }
+                    if let Ok(logs) = log_sub {
+                        let mut log_stream = logs.into_stream();
+                        while let Some(log) = log_stream.next().await {
+                            Self::process_log_event(&log, &event_tx, &seen_hashes_ws);
                         }
-                        Err(e) => warn!("⚠️ [SENTRY] Connection failed {}: {}", endpoint, e),
                     }
-                    // Exponential backoff to avoid spamming failed connections
-                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
-            }));
+                Err(e) => warn!("⚠️ [SENTRY] Connection failed {}: {}", endpoint, e),
+            }
+            // Exponential backoff or simple delay
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
-
-        // Keep the main loop alive
-        for task in tasks {
-            let _ = task.await;
-        }
-        Ok(())
     }
 
     fn process_log_event(
