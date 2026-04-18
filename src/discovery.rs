@@ -80,14 +80,14 @@ impl Discovery {
         // Background task to prevent blocking the main engine startup
         tokio::spawn(async move {
             let current_block = provider.get_block_number().await.unwrap_or_default();
-            // Alpha Hunter Look-Back: Reduced to 100 blocks for Free RPC compatibility (Chainstack/Quicknode).
-            // Paid Archive Nodes are required for deeper historical scans (>128 blocks).
-            let start_block = current_block.saturating_sub(100); 
+            // Alpha Hunter Look-Back: Reduced to 10 blocks for Alchemy Free tier compatibility.
+            // Higher plans allow 100+ blocks.
+            let start_block = current_block.saturating_sub(10); 
 
             let v2_topic = B256::from(constants::EVENT_V2_PAIR_CREATED);
             let v3_topic = B256::from(constants::EVENT_V3_POOL_CREATED);
             let aero_topic = alloy_primitives::fixed_bytes!("0x212847ad1f2f1ad0d76077f4a7f5f3e728cc2ac818eb64fed8004e115fbcca67");
-
+            
             // Single RPC call for 10,000 blocks range as requested to stay under rate limits
             let filter = Filter::new()
                 .from_block(start_block)
@@ -95,6 +95,10 @@ impl Discovery {
                 .event_signature(vec![v2_topic, v3_topic, aero_topic]);
 
             match provider.get_logs(&filter).await {
+                Err(ref e) if e.to_string().contains("-32600") => {
+                    // Alchemy specific fallback: range is too wide for free tier
+                    warn!("⚠️ [ALPHA-LOOKBACK] Range too wide for Free RPC. Discovery restricted to bootstrap pools.");
+                }
                 Ok(logs) => {
                     let mut count = 0;
                     for log in logs {

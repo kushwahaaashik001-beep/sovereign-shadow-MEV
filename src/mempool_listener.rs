@@ -119,7 +119,7 @@ impl MempoolListener {
                             
                             // 2. Subscribe to Sync Events (Uniswap V2 / Aerodrome / BaseSwap)
                             // Topic: Sync(uint112 reserve0, uint112 reserve1)
-                            let v2_sync = fixed_bytes!("1c411e9a96e071241c2f21f7726b17ae89e3ad05159d3f1a05103a5413173d0a");
+                            let v2_sync = fixed_bytes!("1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
                             // V3 Swap Topic: Swap(address,address,int256,int256,uint160,uint128,int24)
                             let v3_swap = fixed_bytes!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
                             

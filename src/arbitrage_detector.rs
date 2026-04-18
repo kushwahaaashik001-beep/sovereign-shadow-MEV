@@ -194,21 +194,14 @@ impl ArbitrageDetector {
         let config = self.config.clone();
 
         // Alpha Hunter: Predator Filter
-        // Competition low rakhne ke liye limit ko 3 kar diya hai. 
         if self.state_mirror.is_congested(&event.swap_info.router, 3) {
             return;
         }
 
         // Pillar T: Sub-block State Projection
-        let impacts = if let Some(ref mempool_tx) = event.mempool_tx {
-            if event.swap_info.amount_in < U256::from(2 * 10u128.pow(16)) { return; } // < 0.02 ETH
-            math.project_reserve_impact(mempool_tx, &state_mirror)
-        } else {
-            FxHashMap::default()
-        };
+        let impacts = math.project_reserve_impact_v2(&event, &state_mirror);
 
-        // AI Alpha Hunter: Specific Liquidity Skew Detection
-        // If an AI pool is heavily skewed (>3% imbalance), we treat it as a high-alpha signal.
+        // [SPIDER-WEB] AI Alpha Hunter: Specific Liquidity Skew Detection
         let is_ai_pool = event.swap_info.token_in == constants::TOKEN_VIRTUAL || event.swap_info.token_out == constants::TOKEN_VIRTUAL ||
                          event.swap_info.token_in == constants::TOKEN_LUNA || event.swap_info.token_out == constants::TOKEN_LUNA ||
                          event.swap_info.token_in == constants::TOKEN_AI16Z || event.swap_info.token_out == constants::TOKEN_AI16Z;
@@ -216,42 +209,24 @@ impl ArbitrageDetector {
         if is_ai_pool {
             if let Some(state) = state_mirror.get_pool_data(&event.swap_info.router, 1) {
                 let skew = math.calculate_liquidity_skew(state.reserves0, state.reserves1);
-                if skew > 1.03 { // > 3% shift
-                    info!("🎯 [AI-SKEW] High volatility detected in AI pool {:?}. Skew: {:.4}. Prioritizing search.", 
-                        event.swap_info.router, skew);
-                    // Force pool activity update to ensure it stays in graph
+                if skew > 1.02 { 
                     self.pool_activity.insert(event.swap_info.router, std::time::Instant::now());
                 }
             }
         }
 
-        // Pillar C: Multi-Directional Back-running Search (In-Memory Math)
+        // [SPIDER-WEB] Multi-Directional Search: Exhaustively check all cycles from trigger pool
         let mut search_directions = Vec::new();
 
         if event.swap_info.token_in.is_zero() {
-            // Back-running trigger: Evaluate both directions of the pool using RAM state
             if let Some(reg) = self.pool_registry.get(&event.swap_info.router) {
-                let (t0, t1, dex) = *reg;
                 search_directions.push((reg.0, reg.1));
                 search_directions.push((reg.1, reg.0));
-                
-                // ALPHA CHAAL: Lagging Sibling Detection
-                // If a CORE pool syncs, immediately check if niche DEXs for the same tokens are lagging.
-                if dex == DexName::Aerodrome || dex == DexName::UniswapV3 {
-                    for sibling in self.pool_registry.iter() {
-                        let (s0, s1, s_dex) = *sibling.value();
-                        if s_dex != DexName::Aerodrome && s_dex != DexName::UniswapV3 {
-                            if (s0 == t0 || s1 == t0) || (s0 == t1 || s1 == t1) {
-                                // Mark sibling pool as "Hot" to force inclusion in next search
-                                self.pool_activity.insert(*sibling.key(), std::time::Instant::now());
-                            }
-                        }
-                    }
-                }
             }
         } else {
-            // Front-running trigger: Evaluate specific swap direction
+            // Back-run trigger (Logs): Check both directions to capture any imbalance (Spider Web in RAM)
             search_directions.push((event.swap_info.token_in, event.swap_info.token_out));
+            search_directions.push((event.swap_info.token_out, event.swap_info.token_in));
         }
 
         for (t_in, t_out) in search_directions {
@@ -489,13 +464,13 @@ impl ArbitrageDetector {
                 let pool_state = entry.value();
                 let mut liq_usd = 0u128;
                 if t0 == constants::TOKEN_USDC {
-                    liq_usd = (pool_state.reserves0.to::<u128>() / 1_000_000) * 2;
+                    liq_usd = (pool_state.reserves0.to::<u128>() / 1_000_000).saturating_mul(2);
                 } else if t1 == constants::TOKEN_USDC {
-                    liq_usd = (pool_state.reserves1.to::<u128>() / 1_000_000) * 2;
+                    liq_usd = (pool_state.reserves1.to::<u128>() / 1_000_000).saturating_mul(2);
                 } else if t0 == constants::TOKEN_WETH {
-                    liq_usd = (pool_state.reserves0.to::<u128>() / 10u128.pow(18)) * 2 * constants::ESTIMATED_ETH_PRICE;
+                    liq_usd = (pool_state.reserves0.to::<u128>() / 10u128.pow(18)).saturating_mul(2).saturating_mul(constants::ESTIMATED_ETH_PRICE);
                 } else if t1 == constants::TOKEN_WETH {
-                    liq_usd = (pool_state.reserves1.to::<u128>() / 10u128.pow(18)) * 2 * constants::ESTIMATED_ETH_PRICE;
+                    liq_usd = (pool_state.reserves1.to::<u128>() / 10u128.pow(18)).saturating_mul(2).saturating_mul(constants::ESTIMATED_ETH_PRICE);
                 }
 
                 // AI Alpha Logic: Verified AI stars require higher liquidity ($10k+)
@@ -504,9 +479,9 @@ impl ArbitrageDetector {
                                  t0 == constants::TOKEN_AI16Z || t1 == constants::TOKEN_AI16Z;
 
                 let is_in_sweet_spot = if is_ai_star {
-                    liq_usd >= constants::MIN_AI_LIQUIDITY_USD && liq_usd <= constants::MAX_ALPHA_LIQUIDITY_USD
+                    liq_usd >= 500 && liq_usd <= constants::MAX_ALPHA_LIQUIDITY_USD // Lowered to catch early AI moves
                 } else {
-                    is_core || (liq_usd >= constants::MIN_ALPHA_LIQUIDITY_USD && liq_usd <= constants::MAX_ALPHA_LIQUIDITY_USD)
+                    is_core || (liq_usd >= 1000 && liq_usd <= constants::MAX_ALPHA_LIQUIDITY_USD) // Catch $1k+ liquidity pools
                 };
 
                 // Predator Filter: Skip congested pools during graph rebuild to avoid high-competition paths
@@ -515,14 +490,12 @@ impl ArbitrageDetector {
                 }
 
                 // Alpha Hunter Logic:
-                // Core pools ko hamesha rakhte hain routing ke liye. 
-                // Alpha pools ko tabhi rakhte hain jab wo Sweet Spot liquidity range mein hon.
-                if !is_core {
-                    let is_niche_dex = dex == DexName::SushiSwap || dex == DexName::BaseSwap || dex == DexName::PancakeSwap;
-                    let should_include = (is_hot || is_alpha || is_niche_dex) && is_in_sweet_spot;
-                    
-                    if !should_include { continue; }
-                }
+                // Re-enabling low-liquidity alpha capture.
+                // Agar pool core hai, alpha hai (new), ya hot hai (activity), toh include karo.
+                let is_niche_dex = dex == DexName::SushiSwap || dex == DexName::BaseSwap || dex == DexName::PancakeSwap;
+                let should_include = is_core || is_alpha || is_hot || is_niche_dex || is_in_sweet_spot;
+                
+                if !should_include { continue; }
 
                 pool_list.push(*pool_addr);
                 tokens_set.insert(t0);

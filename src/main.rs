@@ -227,6 +227,16 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
             loop { interval.tick().await; mirror.prune_stale_pools(600); }
         });
 
+        // [SILENT SNIPER] Periodic Bytecode Persistence (Save to disk every 1 hour)
+        let mirror_persist = state_mirror.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                mirror_persist.save_bytecode_cache();
+            }
+        });
+
         // Pillar B: Reactive State Guard (0% Rate Limit Logic)
         // We only sync via Multicall ONCE at boot and then if a GAP is detected.
         let mirror_sync = state_mirror.clone();
@@ -238,7 +248,9 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
             let mut interval = tokio::time::interval(Duration::from_secs(60)); 
             loop {
                 interval.tick().await;
-                if mirror_sync.dirty_flag.load(Ordering::Acquire) {
+                // Only sync via HTTP if dirty AND it's been a while (throttle to 5 mins)
+                if mirror_sync.dirty_flag.load(Ordering::Acquire) && 
+                   (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - mirror_sync.last_multicall_sync.load(Ordering::Acquire) > 300) {
                     let _ = mirror_sync.sync_all_pools_multicall_pooled(http_pool_sync.clone()).await;
                 }
             }
@@ -283,8 +295,10 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
                         // Bug Fix: Wire block tracker to ensure bundle target_block is correct
                         bb_sync.block_tracker.update(block_number);
                     }
+                } else {
+                    error!("⚠️ [INFRA] WebSocket disconnected. Waiting 2s before retry...");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
             }
         });
     }
@@ -480,41 +494,72 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     // Pillar S: Real-time State Mirror Syncing (The Lifeblood)
     {
         let mirror = state_mirror.clone();
-        let provider = ws_provider.clone();
         let f_tx = force_tx.clone();
 
         // Pillar S: Pre-compute topics to avoid string parsing in the hot loop
         let v2_sync_topic = alloy_primitives::fixed_bytes!("0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
         let v3_swap_topic = alloy_primitives::fixed_bytes!("0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
         
-        tokio::spawn(async move {
-            let filter = alloy::rpc::types::Filter::new()
-                .event_signature(vec![v2_sync_topic, v3_swap_topic]);
-            
-            // Using a dedicated WSS provider just for state logs to ensure 0-lag
-            let mut sub = provider.subscribe_logs(&filter).await.expect("Failed to sub to state logs");
-            info!("📡 [STATE] Real-time Mirror Syncing active (V2 Sync & V3 Swap)");
+        let ws_pool = ws_provider_pool.clone();
 
-            while let Ok(log) = sub.recv().await {
-                let pool_addr = log.address();
+        tokio::spawn(async move {
+            let mut current_sub_count = 0;
+            let mut sub_stream = None;
+
+            loop {
+                let active_pools: Vec<Address> = mirror.pools.iter().map(|e| *e.key()).collect();
                 
-                // NANOSECOND UPDATE: Update DashMap immediately without async overhead
-                if !log.topics().is_empty() && log.topics()[0] == v2_sync_topic {
-                    // V2 Sync Event: [reserve0, reserve1] in data
-                    if log.data().data.len() >= 64 {
-                        let r0 = alloy_primitives::U256::from_be_slice(&log.data().data[0..32]);
-                        let r1 = alloy_primitives::U256::from_be_slice(&log.data().data[32..64]);
-                        mirror.update_v2_reserves(pool_addr, r0, r1);
-                    }
-                } else {
-                    // V3 Swap Event: [..., sqrtPriceX96, tick, ...]
-                    // V3 logs are more complex, but we extract sqrtPrice from the data/topics
-                    if let Some(state) = the_sovereign_shadow::v3_math::decode_v3_swap_log(&log) {
-                        mirror.update_v3_state(pool_addr, state.sqrt_price, state.tick, state.liquidity);
+                // Re-subscribe only if pool count grows significantly (e.g., > 10% change)
+                if sub_stream.is_none() || active_pools.len() > (current_sub_count + (current_sub_count / 10)) {
+                    info!("🔄 [SHADOW-DEX] Updating Targeted Filter: {} pools", active_pools.len());
+                    
+                    let provider = ws_pool.next();
+                    
+                    // Alchemy limit: Address list in filter cannot be infinite, 
+                    // but 5,000-10,000 is usually fine for dedicated subs.
+                    let filter = alloy::rpc::types::Filter::new()
+                        .address(active_pools.clone())
+                        .event_signature(vec![v2_sync_topic, v3_swap_topic]);
+
+                    match provider.subscribe_logs(&filter).await {
+                        Ok(sub) => {
+                            sub_stream = Some(sub.into_stream());
+                            current_sub_count = active_pools.len();
+                            info!("✅ [SHADOW-DEX] Subscription refreshed.");
+                        }
+                        Err(e) => {
+                            error!("❌ [SHADOW-DEX] Sub failed: {}. Retrying with next key...", e);
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            continue;
+                        }
                     }
                 }
-                // Trigger detector to re-evaluate cycles on state change
-                let _ = f_tx.send(());
+
+                if let Some(ref mut stream) = sub_stream {
+                    tokio::select! {
+                        Some(log) = stream.next() => {
+                            let pool_addr = log.address();
+                            if !log.topics().is_empty() {
+                                if log.topics()[0] == v2_sync_topic {
+                                    if log.data().data.len() >= 64 {
+                                        let r0 = alloy_primitives::U256::from_be_slice(&log.data().data[0..32]);
+                                        let r1 = alloy_primitives::U256::from_be_slice(&log.data().data[32..64]);
+                                        mirror.update_v2_reserves(pool_addr, r0, r1);
+                                    }
+                                } else if log.topics()[0] == v3_swap_topic {
+                                    if let Some(state) = the_sovereign_shadow::v3_math::decode_v3_swap_log(&log) {
+                                        mirror.update_v3_state(pool_addr, state.sqrt_price, state.tick, state.liquidity);
+                                    }
+                                }
+                            }
+                            let _ = f_tx.send(());
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                            // Check for new pools discovered in the last 30s
+                            continue;
+                        }
+                    }
+                }
             }
         });
     }
@@ -593,6 +638,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
             }
             _ = &mut shutdown => {
                 info!("🛑 Shutdown — closing Sovereign Shadow");
+                state_mirror.save_bytecode_cache(); // Final save before exit
                 break;
             }
         }

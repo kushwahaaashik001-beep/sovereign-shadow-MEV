@@ -33,34 +33,47 @@ pub type WsProvider = RootProvider<BoxTransport>;
 pub struct WsProviderPool {
     pub providers: Vec<Arc<WsProvider>>,
     pub next: AtomicUsize,
-    pub health: Vec<std::sync::atomic::AtomicBool>,
+    pub health: Vec<std::sync::atomic::AtomicU64>,
+    pub usage_stats: Vec<std::sync::atomic::AtomicU64>, // Hydra Head Usage Tracking
 }
 
 impl WsProviderPool {
     pub fn new(providers: Vec<Arc<WsProvider>>) -> Self {
         let len = providers.len();
         let mut health = Vec::with_capacity(len);
-        for _ in 0..len { health.push(std::sync::atomic::AtomicBool::new(true)); }
-        Self { providers, next: AtomicUsize::new(0), health }
+        let mut usage = Vec::with_capacity(len);
+        for _ in 0..len { 
+            health.push(std::sync::atomic::AtomicU64::new(0)); 
+            usage.push(std::sync::atomic::AtomicU64::new(0));
+        }
+        Self { providers, next: AtomicUsize::new(0), health, usage_stats: usage }
     }
 
-    /// THE LOAD BALANCER: Har call par agla healthy provider return karta hai.
+    /// [HYDRA LOGIC] Har call par agla healthy provider return karta hai aur usage track karta hai.
     pub fn next(&self) -> Arc<WsProvider> {
-        let start_idx = self.next.fetch_add(1, Ordering::Relaxed) % self.providers.len().max(1);
-        
-        // Try to find the next healthy provider starting from current index
-        for i in 0..self.providers.len() {
-            let idx = (start_idx + i) % self.providers.len();
-            if self.health[idx].load(Ordering::Relaxed) {
+        let len = self.providers.len();
+        if len == 0 { panic!("No providers in pool"); }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        for _ in 0..len {
+            let idx = self.next.fetch_add(1, Ordering::Relaxed) % len;
+            // Check if this Hydra head is healthy (cooldown check)
+            if self.health[idx].load(Ordering::Relaxed) <= now {
+                self.usage_stats[idx].fetch_add(1, Ordering::Relaxed);
                 return self.providers[idx].clone();
             }
         }
-        
-        // Fallback to the first one if all are "unhealthy"
+
+        // If all are blocked, return the least-blocked one
         self.providers[0].clone()
     }
 
-    pub fn mark_unhealthy(&self, provider_idx: usize) {
-        self.health[provider_idx].store(false, Ordering::Relaxed);
+    pub fn mark_unhealthy(&self, provider_idx: usize, duration_secs: u64) {
+        let resume_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + duration_secs;
+        self.health[provider_idx].store(resume_at, Ordering::Relaxed);
     }
 }

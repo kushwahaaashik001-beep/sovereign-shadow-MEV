@@ -13,6 +13,8 @@ use rustc_hash::FxHasher;
 use std::hash::BuildHasherDefault;
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use crate::models::DexType;
+use std::fs::File;
+use std::io::{Read, Write};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 pub const MULTICALL_BATCH_SIZE: usize = 200;
@@ -74,6 +76,8 @@ pub struct PoolState {
     pub last_access_ts: u64,
 }
 
+const BYTECODE_CACHE_PATH: &str = "logs/bytecode_cache.bin";
+
 impl Default for PoolState {
     fn default() -> Self {
         Self {
@@ -127,9 +131,12 @@ pub struct StateMirror {
 
 impl StateMirror {
     pub fn new() -> Arc<Self> {
+        let bytecodes = Arc::new(DashMap::with_hasher(BuildHasherDefault::default()));
+        Self::load_bytecode_cache(&bytecodes);
+
         Arc::new(Self {
             pools: Arc::new(DashMap::with_hasher(BuildHasherDefault::default())),
-            bytecodes: Arc::new(DashMap::with_hasher(BuildHasherDefault::default())),
+            bytecodes,
             gas_state: Arc::new(ArcSwap::from_pointee(GasState::default())),
             dirty_flag: Arc::new(AtomicBool::new(true)),
             current_block: Arc::new(AtomicU64::new(0)),
@@ -141,6 +148,47 @@ impl StateMirror {
             poisoned_accounts: Arc::new(DashMap::with_hasher(BuildHasherDefault::default())),
             trader_registry: Arc::new(DashMap::with_hasher(BuildHasherDefault::default())),
         })
+    }
+
+    /// [GOD-LEVEL] Persistent Caching: Saves CUs across bot restarts on Hugging Face.
+    fn load_bytecode_cache(map: &DashMap<Address, Bytecode, BuildHasherDefault<FxHasher>>) {
+        if let Ok(mut file) = File::open(BYTECODE_CACHE_PATH) {
+            let mut buffer = Vec::new();
+            if file.read_to_end(&mut buffer).is_ok() {
+                if let Ok(decoded) = bincode::deserialize::<Vec<(Address, Vec<u8>)>>(&buffer) {
+                    for (addr, code) in decoded {
+                        map.insert(addr, Bytecode::new_raw(rBytes::from(code)));
+                    }
+                    tracing::info!("💾 [HYDRA-SHADOW] Restored {} pools into RAM database", map.len());
+                }
+            }
+        }
+    }
+
+    pub fn save_bytecode_cache(&self) {
+        if let Err(e) = std::fs::create_dir_all("logs") {
+            tracing::error!("❌ [PERSISTENCE] Failed to create logs directory: {}", e);
+            return;
+        }
+
+        // Zero-Copy approach: Collect data as Vec for serialization
+        let mut data = Vec::with_capacity(self.bytecodes.len());
+        for entry in self.bytecodes.iter() {
+            data.push((*entry.key(), entry.value().bytes().to_vec()));
+        }
+        
+        let encoded_res = bincode::serialize(&data);
+        if let Err(e) = encoded_res {
+            tracing::error!("❌ [PERSISTENCE] Serialization failed: {}", e);
+            return;
+        }
+
+        if let Ok(encoded) = encoded_res {
+            if let Ok(mut file) = File::create(BYTECODE_CACHE_PATH) {
+                let _ = file.write_all(&encoded);
+                tracing::info!("💾 [PERSISTENCE] Saved {} bytecodes to disk", data.len());
+            }
+        }
     }
 
     pub async fn sync_block(&self, block_number: u64, base_fee: U256, timestamp: u64) {
@@ -205,13 +253,15 @@ impl StateMirror {
     /// Pillar B/H: Fetch bytecode from RPC and scan for malicious patterns.
     pub async fn fetch_and_cache_bytecode<P: Provider<BoxTransport>>(&self, address: Address, provider: Arc<P>) {
         // Pillar H: Absolute Whitelist
-        // Standard pools aur top tokens ko scan hi mat karo, ye 100% safe hain.
         if crate::constants::CORE_TOKENS.contains(&address) || 
            crate::constants::CORE_POOLS.contains(&address) ||
            crate::constants::TOP_100_POOLS.contains(&address) ||
            self.pools.contains_key(&address) { return; }
         
         if self.bytecodes.contains_key(&address) || self.is_poisoned(&address) { return; }
+
+        // Rate limit protection: Thoda gap do bytecode calls ke beech mein
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         match provider.get_code_at(address).await {
             Ok(code) => {
@@ -275,7 +325,10 @@ impl StateMirror {
         let multicall_addr = alloy_primitives::address!("0xcA11bde05977b3631167028862bE2a173976CA11");
 
         for chunk in pool_addresses.chunks(MULTICALL_BATCH_SIZE) {
-            let provider = pool.next(); // ROTATE KEY FOR EVERY CHUNK
+            // "Slow Hydration" Logic: Add 200ms delay between chunks to stay under CU/sec limits
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            
+            let provider = pool.next(); 
             let multicall = IMulticall3::IMulticall3Instance::new(multicall_addr, provider);
             
             let mut calls = Vec::with_capacity(chunk.len() * 2);

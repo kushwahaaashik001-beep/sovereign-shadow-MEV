@@ -39,6 +39,15 @@ impl MathEngine {
     }
 
     #[inline(always)]
+    pub fn project_reserve_impact_v2(&self, event: &crate::mempool_listener::SwapEvent, mirror: &StateMirror) -> FxHashMap<Address, (U256, U256)> {
+        if let Some(ref tx) = event.mempool_tx {
+            if event.swap_info.amount_in < U256::from(5 * 10u128.pow(15)) { return FxHashMap::default(); }
+            return self.project_reserve_impact(tx, mirror);
+        }
+        FxHashMap::default()
+    }
+
+    #[inline(always)]
     pub fn project_reserve_impact(&self, tx: &MempoolTx, mirror: &StateMirror) -> FxHashMap<Address, (U256, U256)> {
         let mut impacts = FxHashMap::default();
         let data = tx.data.as_ref();

@@ -33,6 +33,7 @@ sha3 = "0.10"
 phf = { version = "0.11", features = ["macros"] }
 uuid = { version = "1.8", features = ["v4"] }
 core_affinity = "0.8"
+bincode = "1.3"
 
 [[bin]]
 name = "the-sovereign-shadow"
