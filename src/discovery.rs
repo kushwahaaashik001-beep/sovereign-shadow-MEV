@@ -78,6 +78,19 @@ impl Discovery {
         
         // Background task to prevent blocking the main engine startup
         tokio::spawn(async move {
+            // [SMART-FILTER] Providers usually block anonymous log filtering.
+            // Adding explicit factory addresses to the filter makes it 100x lighter.
+            let factory_addresses = vec![
+                constants::BASE_AERODROME_FACTORY,
+                constants::BASE_BASESWAP_FACTORY,
+                constants::BASE_PANCAKESWAP_FACTORY,
+                constants::BASE_SUSHISWAP_FACTORY,
+                constants::BASE_MAVERICK_FACTORY,
+                alloy_primitives::address!("0x33128a8fC170d56ED8068699e168a9A301C035De"), // UniV3
+                alloy_primitives::address!("0x04C9F118A4864700721A163744021d21DB27c11f"), // SwapBased
+                alloy_primitives::address!("0x3D2d7681335A74Be482D207137f814bA688849E8"), // AlienBase
+            ];
+
             let (_, provider) = http_pool_for_discovery.get_head(0);
             // Explicitly define type to help compiler inference
             let current_block = provider.get_block_number().await.unwrap_or_default();
@@ -92,8 +105,9 @@ impl Discovery {
             let mut total_discovered = 0;
             while start_block < current_block {
                 let (idx, provider) = http_pool_for_discovery.next(); // Rotate key for every batch
-                let end_batch = (start_block + 500).min(current_block); // Standard batches
+                let end_batch = (start_block + 2000).min(current_block); // Targeted queries allow larger batches
                 let filter = Filter::new()
+                    .address(factory_addresses.clone())
                     .from_block(start_block)
                     .to_block(end_batch)
                     .event_signature(vec![v2_topic, v3_topic, aero_topic]);

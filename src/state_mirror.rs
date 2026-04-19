@@ -449,7 +449,9 @@ impl StateMirror {
                             let liq_res = results_iter.next();
                             if let (Some(s0), Some(l)) = (slot0_res, liq_res) {
                                 if s0.success && l.success {
-                                    if let (Ok(s), Ok(liq)) = (IV3Pool::slot0Call::abi_decode_returns(&s0.returnData.0, true), IV3Pool::liquidityCall::abi_decode_returns(&l.returnData.0, true)) {
+                                    let s_dec = IV3Pool::slot0Call::abi_decode_returns(&s0.returnData.0, true);
+                                    let l_dec = IV3Pool::liquidityCall::abi_decode_returns(&l.returnData.0, true);
+                                    if let (Ok(s), Ok(liq)) = (s_dec, l_dec) {
                                         state.sqrt_price_x96 = U256::from(s.sqrtPriceX96);
                                         state.tick = s.tick.as_i32();
                                         state.liquidity = U256::from(liq._0);

@@ -473,12 +473,22 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
                     ..Default::default()
                 });
 
-            // Pillar L: Proactive Bytecode Warming for X-Ray Scanning
+            // Pillar L: Proactive Data Fetching (Discovery Support)
             // HTTP pool ka use karke WebSocket connections aur rate limits bacha rahe hain.
             let m = mirror_init.clone();
-            let p = http_pool_init.get_head(1).1; // Role: HTTP_SIMULATE (Head 1)
+            let pool_ref = http_pool_init.clone();
             tokio::spawn(async move {
-                m.fetch_and_cache_bytecode(pool_addr, p).await;
+                let p = pool_ref.get_head(1).1;
+                // 1. Fetch Bytecode (Honeypot protection)
+                m.fetch_and_cache_bytecode(pool_addr, p.clone()).await;
+                
+                // 2. Initial State Sync (Graph inclusion)
+                // Background discovered pools need their first reserve update to be valid
+                let _ = m.sync_batch_with_jitter(
+                    &[(pool_addr, dex_type)], 
+                    pool_ref, 
+                    1
+                ).await;
             });
 
                 if let NewPoolEvent::V2(ref data) = event {
