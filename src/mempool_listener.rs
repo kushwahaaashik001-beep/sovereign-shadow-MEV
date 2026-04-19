@@ -119,6 +119,11 @@ impl MempoolListener {
                     let filter = Filter::new().event_signature(vec![v2_sync, v3_swap]);
                     let log_sub = provider.subscribe_logs(&filter).await;
 
+                    // Point #1: Delta Sync - Emitting readiness signal
+                    if log_sub.is_ok() {
+                        info!("🧠 [DELTA-SYNC] Live state monitoring active. No more multicall polling needed.");
+                    }
+
                     if let Ok(logs) = log_sub {
                         let mut log_stream = logs.into_stream();
                         while let Some(log) = log_stream.next().await {
@@ -136,13 +141,15 @@ impl MempoolListener {
         }
     }
 
-    fn update_mirror_state(log: &Log, mirror: &StateMirror) {
+    pub fn update_mirror_state(log: &Log, mirror: &StateMirror) {
         let v2_sync_topic = fixed_bytes!("1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
         let v3_swap_topic = fixed_bytes!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
         
         let pool_addr = log.address();
         if let Some(topic0) = log.topics().first() {
             if *topic0 == v2_sync_topic {
+                // Point #2: Predictive State Mirroring (V2)
+                // Sync event gives absolute reserves, no math needed. This is the ultimate Delta Sync.
                 if log.data().data.len() >= 64 {
                     let r0 = U256::from_be_slice(&log.data().data[0..32]);
                     let r1 = U256::from_be_slice(&log.data().data[32..64]);

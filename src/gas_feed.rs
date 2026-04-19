@@ -26,6 +26,7 @@ impl GasPriceFeed {
 
         tokio::spawn(async move {
             loop {
+                let mut block_count = 0;
                 // Role: WSS_BLOCKS (Head 0)
                 let (_, ws_provider) = pool.get_head(0);
                 if let Ok(sub) = ws_provider.subscribe_blocks().await {
@@ -50,13 +51,16 @@ impl GasPriceFeed {
                             let _ = priority_tx.send((median * U256::from(112)) / U256::from(100));
                         }
 
-                        // Pillar P: Fetch actual L1 Base Fee from Oracle
-                        let oracle = crate::utils::IGasPriceOracle::IGasPriceOracleInstance::new(
-                            crate::constants::OPTIMISM_GAS_ORACLE, 
-                            ws_provider.clone()
-                        );
-                        if let Ok(l1_val) = oracle.l1BaseFee().call().await {
-                            let _ = l1_tx.send(l1_val._0);
+                        // Pillar P: Throttle L1 Oracle calls (Every 5 blocks)
+                        block_count += 1;
+                        if block_count % 5 == 0 {
+                            let oracle = crate::utils::IGasPriceOracle::IGasPriceOracleInstance::new(
+                                crate::constants::OPTIMISM_GAS_ORACLE, 
+                                ws_provider.clone()
+                            );
+                            if let Ok(l1_val) = oracle.l1BaseFee().call().await {
+                                let _ = l1_tx.send(l1_val._0);
+                            }
                         }
                         
                         // Pillar P: Network Heat Adjustment (Congestion Sleep)

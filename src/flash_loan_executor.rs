@@ -113,13 +113,16 @@ impl FlashLoanExecutor {
         // Static analysis must happen before dynamic simulation for 100% coverage.
         // HTTP pool ka use karke rapid fire honeypot checks kar rahe hain.
         let mut fetch_tasks = Vec::with_capacity(opp.path.hops.len() * 2);
-        let fetch_provider_tuple = self.http_pool.as_ref().map(|p| p.get_head(1)) // Role: HTTP_SIMULATE (Head 1)
-            .unwrap_or_else(|| (0, self.provider.clone()));
-        let fetch_provider = fetch_provider_tuple.1;
+        let fetch_provider = self.http_pool.as_ref().map(|p| p.get_head(1).1).unwrap_or_else(|| self.provider.clone());
 
         for hop in &opp.path.hops {
-            fetch_tasks.push(self.state_simulator.mirror.fetch_and_cache_bytecode(hop.token_out, fetch_provider.clone()));
-            fetch_tasks.push(self.state_simulator.mirror.fetch_and_cache_bytecode(hop.pool_address, fetch_provider.clone()));
+            // Only fetch if NOT in cache to save RPC credits
+            if self.state_simulator.mirror.get_bytecode(&hop.token_out).is_none() {
+                fetch_tasks.push(self.state_simulator.mirror.fetch_and_cache_bytecode(hop.token_out, fetch_provider.clone()));
+            }
+            if self.state_simulator.mirror.get_bytecode(&hop.pool_address).is_none() {
+                fetch_tasks.push(self.state_simulator.mirror.fetch_and_cache_bytecode(hop.pool_address, fetch_provider.clone()));
+            }
         }
         futures::future::join_all(fetch_tasks).await;
 

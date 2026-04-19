@@ -10,13 +10,13 @@ use the_sovereign_shadow::state_mirror::StateMirror;
 use the_sovereign_shadow::discovery::Discovery;
 use the_sovereign_shadow::factory_scanner::{FactoryScanner, NewPoolEvent};
 use the_sovereign_shadow::state_simulator::StateSimulator;
-use the_sovereign_shadow::mempool_listener::{MempoolListener, MempoolListenerConfig};
+use the_sovereign_shadow::mempool_listener::MempoolListener;
 use the_sovereign_shadow::utils::{CircuitBreaker, L1DataFeeCalculator};
 use the_sovereign_shadow::{constants, telemetry, WsProviderPool};
 use dotenv::dotenv;
 use alloy::providers::{ProviderBuilder, WsConnect, Provider};
 use alloy::signers::local::PrivateKeySigner;
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, U256, fixed_bytes};
 use std::error::Error;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use futures_util::StreamExt;
 use std::env;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use dashmap::DashSet;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, filter::LevelFilter};
 
@@ -236,11 +236,14 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
             }
         });
 
-        // [ZERO-POLLING] Batch Loading via HTTP_SYNC (Head 0)
-        let mirror_boot = state_mirror.clone();
-        let sync_pool = http_provider_pool.clone();
+        // [SILENT SNIPER] State Checkpoint (Save to disk every 15 minutes)
+        let mirror_state_persist = state_mirror.clone();
         tokio::spawn(async move {
-            let _ = mirror_boot.sync_all_pools_multicall_pooled(sync_pool).await;
+            let mut interval = tokio::time::interval(Duration::from_secs(900));
+            loop {
+                interval.tick().await;
+                mirror_state_persist.save_state_checkpoint();
+            }
         });
     }
 
@@ -260,36 +263,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
         Some(http_provider_pool.clone()),
     ).await?);
 
-    // Pillar E: Real-time Block Tracker & State Mirror Sync (Heartbeat)
-    // This task ensures all bundles target the correct next block
-    {
-        let cb_sync = circuit_breaker.clone();
-        let mirror_sync = state_mirror.clone();
-        let bb_sync = bundle_builder.clone();
-        let ws_pool = ws_provider_pool.clone();
-        tokio::spawn(async move {
-            loop {
-                // Role: WSS_BLOCKS (Head 0)
-                let (_, ws_provider) = ws_pool.get_head(0);
-                if let Ok(sub) = ws_provider.subscribe_blocks().await {
-                    let mut stream = sub.into_stream();
-                    while let Some(block) = stream.next().await {
-                        let block_number = block.header.number;
-                        let base_fee = U256::from(block.header.base_fee_per_gas.unwrap_or_default());
-                        let timestamp = block.header.timestamp;
-                        
-                        mirror_sync.sync_block(block_number, base_fee, timestamp).await;
-                        cb_sync.record_sequencer_drift(timestamp); // Pillar T: Track L2 Sequencer Lag
-                        // Bug Fix: Wire block tracker to ensure bundle target_block is correct
-                        bb_sync.block_tracker.update(block_number);
-                    }
-                } else {
-                    error!("⚠️ [INFRA] WebSocket disconnected. Waiting 2s before retry...");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-            }
-        });
-    }
+    // [CLEANUP] Redundant block tracker removed. Logic is handled by Unified Heartbeat below.
 
     let profit_manager = Arc::new(ProfitManager::new(
         http_provider_pool.get_head(2).1, // Role: HTTP_FLASHBOTS (Head 2)
@@ -332,7 +306,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     detector_config.executor_address = executor_address;
     detector_config.bribe_percent = 60;
     detector_config.scanner_threads = 16;
-    detector_config.min_profit_wei = U256::from(10u64.pow(13));
+    detector_config.min_profit_wei = U256::from(2 * 10u128.pow(14)); // $0.50 floor for stability
 
     let (detector, mut opp_rx, _) = ArbitrageDetector::new(
         detector_config,
@@ -348,17 +322,17 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     // Nerve Bridge C: Start the Brain immediately so it catches the Bootstrap events
     tokio::spawn(async move { detector.run().await; });
 
-    // Pillar Q: Bootstrap Protocol (Minimal RPC calls)
+    // Point #1: Full Sync happens ONLY at bootstrap. 
     info!("🛠️ [PILLAR Q] Executing Bootstrap Protocol...");
     {
-        // Parallelize initial health checks and mirror sync
+        // Point #2: Background "Lazy" Bootstrapping
         let inv = inventory_manager.clone();
         let mirror = state_mirror.clone();
         let pool = http_provider_pool.clone();
         
-        let _ = tokio::join!(
+        let _ = tokio::try_join!(
             inv.ensure_ready(),
-            mirror.sync_all_pools_multicall_pooled(pool)
+            mirror.smart_bootstrap(pool)
         );
 
         let _ = ws_setup_provider.get_block_number().await?;
@@ -385,22 +359,59 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
         });
     }
 
-    // Role: WSS_LOGS (Head 1)
-    let log_endpoint = working_wss.get(1).cloned().unwrap_or_else(|| working_wss[0].clone());
-    let (mempool_listener, mut mempool_rx, _priority_rx) = MempoolListener::new(
-        MempoolListenerConfig {
-            endpoints: vec![log_endpoint], 
-            chain,
-            min_gas_price_gwei: 0,
-            ..Default::default()
-        },
-        None,
-    ).await?;
+    // [GOD-LEVEL] Unified Heartbeat: Sirf 1 WSS Connection poore bot ke liye
+    let (unified_log_tx, mut unified_log_rx) = mpsc::unbounded_channel();
+    let (unified_block_tx, _) = broadcast::channel(128);
+    
+    let wss_heartbeat_url = working_wss[0].clone(); // Use only the most stable key
+    let mirror_heartbeat = state_mirror.clone();
+    let block_tx_heartbeat = unified_block_tx.clone();
+    let bb_heartbeat = bundle_builder.clone();
+    let cb_heartbeat = circuit_breaker.clone();
 
-    let mirror_for_run = state_mirror.clone();
     tokio::spawn(async move {
-        if let Err(e) = mempool_listener.run(mirror_for_run).await {
-            error!("❌ Mempool Listener crashed: {:?}", e);
+        loop {
+            let ws = WsConnect::new(wss_heartbeat_url.clone());
+            if let Ok(provider) = ProviderBuilder::new().on_ws(ws).await {
+                info!("✅ [HEARTBEAT] Unified Pipe Connected: {}", wss_heartbeat_url);
+                
+                let v2_sync = fixed_bytes!("1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
+                let v3_swap = fixed_bytes!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
+                
+                // PILLAR Z: Global Subscription (No address filter)
+                // RPC se sirf topic mango, filtering Rust side par HashSet se hogi.
+                let filter = alloy::rpc::types::Filter::new().event_signature(vec![v2_sync, v3_swap]);
+
+                let sub_logs = provider.subscribe_logs(&filter).await;
+                let sub_blocks = provider.subscribe_blocks().await;
+
+                if let (Ok(logs), Ok(blocks)) = (sub_logs, sub_blocks) {
+                    let mut log_stream = logs.into_stream();
+                    let mut block_stream = blocks.into_stream();
+
+                    loop {
+                        tokio::select! {
+                            Some(log) = log_stream.next() => {
+                                // PILLAR S: Local Filter (Zero-Cost)
+                                // Sirf un pools ko update karo jo registry mein hain.
+                                MempoolListener::update_mirror_state(&log, &mirror_heartbeat);
+                                let _ = unified_log_tx.send(log);
+                            }
+                            Some(block) = block_stream.next() => {
+                                let bn = block.header.number;
+                                let fee = U256::from(block.header.base_fee_per_gas.unwrap_or_default());
+                                mirror_heartbeat.sync_block(bn, fee, block.header.timestamp).await;
+                                cb_heartbeat.record_sequencer_drift(block.header.timestamp);
+                                bb_heartbeat.block_tracker.update(bn);
+                                let _ = block_tx_heartbeat.send(bn);
+                            }
+                            else => break,
+                        }
+                    }
+                }
+            }
+            warn!("⚠️ [HEARTBEAT] Connection lost. Reconnecting in 5s...");
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
 
@@ -413,22 +424,28 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     let seen_hashes_local = seen_hashes.clone();
     let mirror_bridge = state_mirror.clone();
     tokio::spawn(async move {
-        while let Some(event) = mempool_rx.recv().await {
+        while let Some(log) = unified_log_rx.recv().await {
             // Pillar U: Zero-Cost Deduplication. Multi-endpoint streaming sync.
-            if !seen_hashes_local.insert(event.tx_hash) {
-                continue;
-            }
-            
-            // Pillar W: Feed organic traders into the registry
-            mirror_bridge.record_trader(event.swap_info.router, event.sender);
+            let tx_hash = log.transaction_hash.unwrap_or_default();
+            if !seen_hashes_local.insert(tx_hash) { continue; }
 
-            // Self-Cleaning Cache: Keep RAM tight for Hugging Face
-            if seen_hashes_local.len() > 50_000 { 
-                seen_hashes_local.clear(); 
-                info!("🧹 [CLEANUP] Deduplication cache cleared to save RAM");
+            // PILLAR Z: Convert Global Log to SwapEvent for the Brain
+            if mirror_bridge.pools.contains_key(&log.address()) {
+                let event = the_sovereign_shadow::mempool_listener::SwapEvent {
+                    tx_hash,
+                    sender: alloy_primitives::Address::ZERO,
+                    swap_info: the_sovereign_shadow::models::SwapInfo {
+                        dex: the_sovereign_shadow::models::DexName::UniswapV2,
+                        router: log.address(),
+                        ..Default::default()
+                    },
+                    effective_gas_price: alloy_primitives::U256::ZERO,
+                    received_at: std::time::Instant::now(),
+                    is_whale_trigger: false,
+                    mempool_tx: None,
+                };
+                let _ = s_tx.send(event).await;
             }
-
-            let _ = s_tx.send(event).await;
         }
     });
 
@@ -482,80 +499,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
         discovery.warm_start().await;
     }
 
-    // Pillar S: Real-time State Mirror Syncing (The Lifeblood)
-    {
-        let mirror = state_mirror.clone();
-
-        // Pillar S: Pre-compute topics to avoid string parsing in the hot loop
-        let v2_sync_topic = alloy_primitives::fixed_bytes!("0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
-        let v3_swap_topic = alloy_primitives::fixed_bytes!("0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
-        
-        let ws_pool = ws_provider_pool.clone();
-
-        tokio::spawn(async move {
-            let mut current_sub_count = 0;
-            let mut sub_stream = None;
-
-            loop {
-                let active_pools: Vec<Address> = mirror.pools.iter().map(|e| *e.key()).collect();
-                
-                // Re-subscribe only if pool count grows significantly (e.g., > 10% change)
-                if sub_stream.is_none() || active_pools.len() > (current_sub_count + (current_sub_count / 10)) {
-                    info!("🔄 [SHADOW-DEX] Updating Targeted Filter: {} pools", active_pools.len());
-                    
-                    // Role: WSS_LOGS (Head 1)
-                    let (idx, provider) = ws_pool.get_head(1);
-                    
-                    // Alchemy limit: Address list in filter cannot be infinite, 
-                    // but 5,000-10,000 is usually fine for dedicated subs.
-                    let filter = alloy::rpc::types::Filter::new()
-                        .address(active_pools.clone())
-                        .event_signature(vec![v2_sync_topic, v3_swap_topic]);
-
-                    match provider.subscribe_logs(&filter).await {
-                        Ok(sub) => {
-                            sub_stream = Some(sub.into_stream());
-                            current_sub_count = active_pools.len();
-                            info!("✅ [SHADOW-DEX] Subscription refreshed.");
-                        }
-                        Err(e) => {
-                            error!("❌ [SHADOW-DEX] Sub failed: {}. Retrying with next key...", e);
-                            ws_pool.mark_unhealthy(idx, 60);
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                            continue;
-                        }
-                    }
-                }
-
-                if let Some(ref mut stream) = sub_stream {
-                    tokio::select! {
-                        Some(log) = stream.next() => {
-                            let pool_addr = log.address();
-                            if !log.topics().is_empty() {
-                                if log.topics()[0] == v2_sync_topic {
-                                    if log.data().data.len() >= 64 {
-                                        let r0 = alloy_primitives::U256::from_be_slice(&log.data().data[0..32]);
-                                        let r1 = alloy_primitives::U256::from_be_slice(&log.data().data[32..64]);
-                                        mirror.update_v2_reserves(pool_addr, r0, r1);
-                                    }
-                                } else if log.topics()[0] == v3_swap_topic {
-                                    if let Some(state) = the_sovereign_shadow::v3_math::decode_v3_swap_log(&log) {
-                                        mirror.update_v3_state(pool_addr, state.sqrt_price, state.tick, state.liquidity);
-                                    }
-                                }
-                            }
-                            // [PERFORMANCE FIX] REMOVED f_tx.send(()) 
-                            // Rebuilding the graph on every price update is redundant and causes lag.
-                        }
-                        _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                            // Check for new pools discovered in the last 30s
-                            continue;
-                        }
-                    }
-                }
-            }
-        });
-    }
+    // [REDUNDANT] Task merged into Unified Heartbeat to save RPC connections.
 
     info!("🚀 Sovereign Shadow LIVE — hunting alpha at nanosecond speed");
     if executor_address == Address::ZERO {

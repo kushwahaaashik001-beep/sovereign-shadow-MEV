@@ -66,7 +66,7 @@ pub struct PoolKey {
     pub pool: Address,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SwapInfo {
     pub dex: DexName,
     pub router: Address,

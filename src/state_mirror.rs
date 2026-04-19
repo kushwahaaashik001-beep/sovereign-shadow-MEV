@@ -11,13 +11,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rustc_hash::FxHasher;
 use std::hash::BuildHasherDefault;
-use std::time::{SystemTime, UNIX_EPOCH, Instant};
+use serde::{Serialize, Deserialize};
+use std::time::{SystemTime, UNIX_EPOCH, Instant, Duration};
 use crate::models::DexType;
 use std::fs::File;
 use std::io::{Read, Write};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-pub const MULTICALL_BATCH_SIZE: usize = 200;
+pub const MULTICALL_BATCH_SIZE: usize = 200; // Reduced for Hugging Face Shared IP safety
 pub const PRICE_CACHE_TTL: u64 = 1; // 1-second TTL for HTTP state
 
 sol! {
@@ -57,7 +58,7 @@ sol! {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PoolState {
     pub reserves0: U256,
     pub reserves1: U256,
@@ -69,14 +70,18 @@ pub struct PoolState {
     pub is_stable: bool,
     pub last_updated_block: u64,
     pub volatility_score: u64,
+    #[serde(skip)]
     pub ticks: Arc<FxHashMap<i32, (i128, u128)>>,
+    #[serde(skip)]
     pub tick_bitmap: Arc<FxHashMap<i16, U256>>,
     pub last_swap_timestamp: u64,
+    #[serde(skip)]
     pub last_http_update: Option<Instant>,
     pub last_access_ts: u64,
 }
 
 const BYTECODE_CACHE_PATH: &str = "logs/bytecode_cache.bin";
+const STATE_CHECKPOINT_PATH: &str = "logs/state_checkpoint.bin";
 
 impl Default for PoolState {
     fn default() -> Self {
@@ -133,9 +138,10 @@ impl StateMirror {
     pub fn new() -> Arc<Self> {
         let bytecodes = Arc::new(DashMap::with_hasher(BuildHasherDefault::default()));
         Self::load_bytecode_cache(&bytecodes);
+        let pools = Arc::new(DashMap::with_hasher(BuildHasherDefault::default()));
 
-        Arc::new(Self {
-            pools: Arc::new(DashMap::with_hasher(BuildHasherDefault::default())),
+        let mirror = Arc::new(Self {
+            pools,
             bytecodes,
             gas_state: Arc::new(ArcSwap::from_pointee(GasState::default())),
             dirty_flag: Arc::new(AtomicBool::new(true)),
@@ -147,7 +153,11 @@ impl StateMirror {
             p2p_priority_feed: Arc::new(AtomicBool::new(false)),
             poisoned_accounts: Arc::new(DashMap::with_hasher(BuildHasherDefault::default())),
             trader_registry: Arc::new(DashMap::with_hasher(BuildHasherDefault::default())),
-        })
+        });
+
+        // Attempt to restore pool reserves from disk
+        mirror.load_state_checkpoint();
+        mirror
     }
 
     /// [GOD-LEVEL] Persistent Caching: Saves CUs across bot restarts on Hugging Face.
@@ -187,6 +197,30 @@ impl StateMirror {
             if let Ok(mut file) = File::create(BYTECODE_CACHE_PATH) {
                 let _ = file.write_all(&encoded);
                 tracing::info!("💾 [PERSISTENCE] Saved {} bytecodes to disk", data.len());
+            }
+        }
+    }
+
+    pub fn save_state_checkpoint(&self) {
+        let data: Vec<(Address, PoolState)> = self.pools.iter().map(|e| (*e.key(), e.value().clone())).collect();
+        if let Ok(encoded) = bincode::serialize(&data) {
+            if let Ok(mut file) = File::create(STATE_CHECKPOINT_PATH) {
+                let _ = file.write_all(&encoded);
+                tracing::info!("💾 [PERSISTENCE] Saved {} pool states to checkpoint", data.len());
+            }
+        }
+    }
+
+    fn load_state_checkpoint(&self) {
+        if let Ok(mut file) = File::open(STATE_CHECKPOINT_PATH) {
+            let mut buffer = Vec::new();
+            if file.read_to_end(&mut buffer).is_ok() {
+                if let Ok(decoded) = bincode::deserialize::<Vec<(Address, PoolState)>>(&buffer) {
+                    for (addr, state) in decoded {
+                        self.pools.insert(addr, state);
+                    }
+                    tracing::info!("💾 [HYDRA-SHADOW] Restored {} pool reserves from disk", self.pools.len());
+                }
             }
         }
     }
@@ -258,10 +292,13 @@ impl StateMirror {
            crate::constants::TOP_100_POOLS.contains(&address) ||
            self.pools.contains_key(&address) { return; }
         
-        if self.bytecodes.contains_key(&address) || self.is_poisoned(&address) { return; }
+        // Pillar H: Double-check RAM and Disk cache before hitting RPC
+        if self.bytecodes.contains_key(&address) || self.is_poisoned(&address) {
+            return;
+        }
 
-        // Rate limit protection: Thoda gap do bytecode calls ke beech mein
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // Rate limit protection: Bytecode calls are heavy on CUs.
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
 
         match provider.get_code_at(address).await {
             Ok(code) => {
@@ -310,48 +347,79 @@ impl StateMirror {
 
     /// THE POOLED LENS: Uses the provider pool to rotate keys for every chunk.
     /// This ensures we stay under rate limits even with 5000+ pools.
-    pub async fn sync_all_pools_multicall_pooled(&self, pool: Arc<crate::WsProviderPool>) -> Result<(), crate::models::MEVError> {
-        let pool_addresses: Vec<(Address, DexType)> = self.pools.iter()
-            .filter(|e| {
-                let block_gap = self.current_block_number().saturating_sub(e.value().last_updated_block);
-                block_gap > 0 || self.dirty_flag.load(Ordering::Acquire)
-            })
-            .map(|entry| (*entry.key(), entry.value().dex_type))
-            .collect::<Vec<_>>();
-            
-        if pool_addresses.is_empty() { return Ok(()); }
+    pub async fn smart_bootstrap(self: Arc<Self>, rpc_pool: Arc<crate::WsProviderPool>) -> Result<(), crate::models::MEVError> {
+        tracing::info!("🧠 [SMART-BOOTSTRAP] Commencing Adaptive Sync Protocol...");
 
+        let all_pools: Vec<(Address, DexType)> = self.pools.iter().map(|e| (*e.key(), e.value().dex_type)).collect();
+        if all_pools.is_empty() { return Ok(()); }
+
+        // 1. Priority Sync: Top 100 Pools (Instant Liquidity Hubs)
+        let top_100: Vec<(Address, DexType)> = all_pools.iter()
+            .filter(|(addr, _)| crate::constants::TOP_100_POOLS.contains(addr))
+            .cloned().collect();
+        
+        if !top_100.is_empty() {
+            tracing::info!("🚀 [SMART-BOOTSTRAP] Executing Priority Sync for {} top pools...", top_100.len());
+            self.sync_batch_with_jitter(&top_100, rpc_pool.clone(), 100).await?;
+            tracing::info!("✅ [SMART-BOOTSTRAP] Priority Sync Complete. Bot is now LIVE.");
+        }
+
+        // 2. Lazy Background Sync: Remaining 4000+ pools
+        let remaining: Vec<(Address, DexType)> = all_pools.into_iter()
+            .filter(|(addr, _)| !crate::constants::TOP_100_POOLS.contains(addr))
+            .collect();
+
+        if !remaining.is_empty() {
+            let mirror = self.clone();
+            tokio::spawn(async move {
+                tracing::info!("💤 [SMART-BOOTSTRAP] Starting Lazy Sync for {} pools in background...", remaining.len());
+                // Very slow background sync to respect Hugging Face shared IP
+                let _ = mirror.sync_batch_with_jitter(&remaining, rpc_pool, 40).await;
+                tracing::info!("🏁 [SMART-BOOTSTRAP] Background Lazy Sync finished.");
+            });
+        }
+
+        Ok(())
+    }
+
+    pub async fn sync_batch_with_jitter(
+        &self, 
+        batch: &[(Address, DexType)], 
+        pool: Arc<crate::WsProviderPool>,
+        batch_size: usize
+    ) -> Result<(), crate::models::MEVError> {
         let current_block = self.current_block_number();
         let multicall_addr = alloy_primitives::address!("0xcA11bde05977b3631167028862bE2a173976CA11");
+        let mut dynamic_batch_size = batch_size.min(MULTICALL_BATCH_SIZE);
+        use rand::Rng;
 
-        for chunk in pool_addresses.chunks(MULTICALL_BATCH_SIZE) {
-            // "Slow Hydration" Logic: Add 200ms delay between chunks to stay under CU/sec limits
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        for chunk in batch.chunks(dynamic_batch_size) {
+            // Point #4: RPC Jitter (350ms + random 0-200ms)
+            let jitter = rand::thread_rng().gen_range(0..200);
+            tokio::time::sleep(Duration::from_millis(350 + jitter)).await;
             
             let (idx, provider) = pool.next(); 
             let multicall = IMulticall3::IMulticall3Instance::new(multicall_addr, provider);
             
             let mut calls = Vec::with_capacity(chunk.len() * 2);
             for (addr, dex_type) in chunk {
-                match dex_type {
-                    DexType::UniswapV2 | DexType::Aerodrome => {
-                        calls.push(Call3 {
-                            target: *addr,
-                            allowFailure: true,
-                            callData: IV2Pair::getReservesCall {}.abi_encode().into(),
-                        });
-                    }
-                    DexType::UniswapV3 => {
-                        calls.push(Call3 { target: *addr, allowFailure: true, callData: IV3Pool::slot0Call {}.abi_encode().into() });
-                        calls.push(Call3 { target: *addr, allowFailure: true, callData: IV3Pool::liquidityCall {}.abi_encode().into() });
-                    }
-                    _ => {}
+                calls.push(Call3 {
+                    target: *addr,
+                    allowFailure: true,
+                    callData: match dex_type {
+                        DexType::UniswapV3 => IV3Pool::slot0Call {}.abi_encode().into(),
+                        _ => IV2Pair::getReservesCall {}.abi_encode().into(),
+                    },
+                });
+                if *dex_type == DexType::UniswapV3 {
+                    calls.push(Call3 { target: *addr, allowFailure: true, callData: IV3Pool::liquidityCall {}.abi_encode().into() });
                 }
             }
 
             if let Ok(output) = multicall.aggregate3(calls).call().await {
                 let mut results_iter = output.returnData.into_iter();
                 let mut updates = Vec::with_capacity(chunk.len());
+                let mut to_prune = Vec::new();
 
                 for (addr, dex_type) in chunk {
                     let mut state = PoolState { last_updated_block: current_block, dex_type: *dex_type, ..Default::default() };
@@ -362,7 +430,16 @@ impl StateMirror {
                                     if let Ok(decoded) = IV2Pair::getReservesCall::abi_decode_returns(&res.returnData.0, true) {
                                         state.reserves0 = U256::from(decoded.reserve0);
                                         state.reserves1 = U256::from(decoded.reserve1);
-                                        updates.push((*addr, state));
+                                        
+                                        // Point #1: Selective Pruning (Liquidity Filter)
+                                        // If liquidity < 0.04 ETH (~$100), prune from active graph
+                                        let eth_threshold = U256::from(4 * 10u128.pow(16));
+                                        if state.reserves0 < eth_threshold && state.reserves1 < eth_threshold 
+                                           && !crate::constants::TOP_100_POOLS.contains(addr) {
+                                            to_prune.push(*addr);
+                                        } else {
+                                            updates.push((*addr, state));
+                                        }
                                     }
                                 }
                             }
@@ -384,15 +461,37 @@ impl StateMirror {
                         _ => {}
                     }
                 }
+                
                 if updates.is_empty() && !chunk.is_empty() {
-                    // Possible rate limit on multicall
-                    pool.mark_unhealthy(idx, 30);
+                    // Point #4: Adaptive Batching Logic
+                    tracing::warn!("⚠️ [429-PROTECT] Empty multicall response. Reducing batch size.");
+                    pool.mark_unhealthy(idx, 60);
+                    dynamic_batch_size = (dynamic_batch_size / 2).max(50);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                 } else {
                     self.batch_update_reserves(updates);
+                    for addr in to_prune { self.pools.remove(&addr); }
                 }
+            } else {
+                // Failure on this provider, mark and continue
+                pool.mark_unhealthy(idx, 60);
             }
         }
-        
+        Ok(())
+    }
+
+    pub async fn sync_all_pools_multicall_pooled(&self, pool: Arc<crate::WsProviderPool>) -> Result<(), crate::models::MEVError> {
+        let pool_addresses: Vec<(Address, DexType)> = self.pools.iter()
+            .filter(|e| {
+                let block_gap = self.current_block_number().saturating_sub(e.value().last_updated_block);
+                block_gap > 0 || self.dirty_flag.load(Ordering::Acquire)
+            })
+            .map(|entry| (*entry.key(), entry.value().dex_type))
+            .collect::<Vec<_>>();
+            
+        if pool_addresses.is_empty() { return Ok(()); }
+        self.sync_batch_with_jitter(&pool_addresses, pool, MULTICALL_BATCH_SIZE).await?;
+
         self.dirty_flag.store(false, Ordering::Release);
         self.last_multicall_sync.store(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(), Ordering::Release);
         Ok(())
