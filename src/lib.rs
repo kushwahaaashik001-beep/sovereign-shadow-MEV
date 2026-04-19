@@ -80,8 +80,8 @@ impl WsProviderPool {
     }
 
     pub fn mark_unhealthy(&self, provider_idx: usize, duration_secs: u64) {
-        // Hugging Face IP protection: Increase cooldown to 60s minimum on 429s
-        let resume_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + duration_secs.max(60);
+        // Hugging Face Shared IP protection: 120s minimum cooldown for 429 errors
+        let resume_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + duration_secs.max(120);
         self.health[provider_idx].store(resume_at, Ordering::Relaxed);
     }
 }

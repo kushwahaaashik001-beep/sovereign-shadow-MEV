@@ -449,52 +449,41 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    let mut pool_rx = pool_tx.subscribe();
-
-    // Pillar Z: Proactive Pool Initialization Task
+    // Pillar Z: Sequential Pool Initialization Worker (HF 429 Shield)
+    let (init_tx, mut init_rx) = mpsc::channel::<(Address, the_sovereign_shadow::models::DexType)>(2048);
     let mirror_init = state_mirror.clone();
     let http_pool_init = http_provider_pool.clone();
     tokio::spawn(async move {
+        while let Some((pool_addr, dex_type)) = init_rx.recv().await {
+            // Sequential logic ensures we never burst RPC providers on Hugging Face
+            let p = http_pool_init.get_head(1).1;
+            mirror_init.fetch_and_cache_bytecode(pool_addr, p.clone()).await;
+            
+            let _ = mirror_init.sync_batch_with_jitter(
+                &[(pool_addr, dex_type)], 
+                http_pool_init.clone(), 
+                1
+            ).await;
+            
+            // Extra breathing room between individual pool syncs
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+
+    let mut pool_rx = pool_tx.subscribe();
+    let mirror_feed = state_mirror.clone();
+    tokio::spawn(async move {
         while let Ok(event) = pool_rx.recv().await {
-                let (pool_addr, dex_type) = match event {
-                    NewPoolEvent::V2(ref d) => {
-                        let dt = match d.dex_name {
-                            the_sovereign_shadow::models::DexName::Aerodrome => the_sovereign_shadow::models::DexType::Aerodrome,
-                            _ => the_sovereign_shadow::models::DexType::UniswapV2,
-                        };
-                        (d.pair, dt)
-                    }
-                    NewPoolEvent::V3(ref d) => (d.pool, the_sovereign_shadow::models::DexType::UniswapV3),
+            let (pool_addr, dex_type) = match event {
+                NewPoolEvent::V2(ref d) => (d.pair, if d.dex_name == the_sovereign_shadow::models::DexName::Aerodrome { the_sovereign_shadow::models::DexType::Aerodrome } else { the_sovereign_shadow::models::DexType::UniswapV2 }),
+                NewPoolEvent::V3(ref d) => (d.pool, the_sovereign_shadow::models::DexType::UniswapV3),
             };
+            mirror_feed.pools.entry(pool_addr).or_insert(the_sovereign_shadow::state_mirror::PoolState { dex_type, ..Default::default() });
+            let _ = init_tx.send((pool_addr, dex_type)).await;
 
-                // Seed state mirror so background sync can pick it up
-                mirror_init.pools.entry(pool_addr).or_insert(the_sovereign_shadow::state_mirror::PoolState {
-                    dex_type,
-                    ..Default::default()
-                });
-
-            // Pillar L: Proactive Data Fetching (Discovery Support)
-            // HTTP pool ka use karke WebSocket connections aur rate limits bacha rahe hain.
-            let m = mirror_init.clone();
-            let pool_ref = http_pool_init.clone();
-            tokio::spawn(async move {
-                let p = pool_ref.get_head(1).1;
-                // 1. Fetch Bytecode (Honeypot protection)
-                m.fetch_and_cache_bytecode(pool_addr, p.clone()).await;
-                
-                // 2. Initial State Sync (Graph inclusion)
-                // Background discovered pools need their first reserve update to be valid
-                let _ = m.sync_batch_with_jitter(
-                    &[(pool_addr, dex_type)], 
-                    pool_ref, 
-                    1
-                ).await;
-            });
-
-                if let NewPoolEvent::V2(ref data) = event {
+            if let NewPoolEvent::V2(ref data) = event {
                 if data.dex_name == the_sovereign_shadow::models::DexName::Aerodrome {
-                    let mirror = mirror_init.clone();
-                    mirror.update_aerodrome_stable(data.pair, true);
+                    mirror_feed.update_aerodrome_stable(data.pair, true);
                 }
             }
         }

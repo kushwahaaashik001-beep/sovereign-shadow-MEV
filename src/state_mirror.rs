@@ -18,7 +18,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-pub const MULTICALL_BATCH_SIZE: usize = 200; // Reduced for Hugging Face Shared IP safety
+pub const MULTICALL_BATCH_SIZE: usize = 50; // Optimized for Shared IP Environments
 pub const PRICE_CACHE_TTL: u64 = 1; // 1-second TTL for HTTP state
 
 sol! {
@@ -394,9 +394,9 @@ impl StateMirror {
         use rand::Rng;
 
         for chunk in batch.chunks(dynamic_batch_size) {
-            // Point #4: RPC Jitter (350ms + random 0-200ms)
+            // [HF-STABILITY] Increased base delay to 1000ms for Shared IP safety
             let jitter = rand::thread_rng().gen_range(0..200);
-            tokio::time::sleep(Duration::from_millis(350 + jitter)).await;
+            tokio::time::sleep(Duration::from_millis(1000 + jitter)).await;
             
             let (idx, provider) = pool.next(); 
             let multicall = IMulticall3::IMulticall3Instance::new(multicall_addr, provider);
