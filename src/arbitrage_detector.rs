@@ -473,6 +473,8 @@ impl ArbitrageDetector {
                     liq_usd = (pool_state.reserves1.to::<u128>() / 10u128.pow(18)).saturating_mul(2).saturating_mul(constants::ESTIMATED_ETH_PRICE);
                 }
 
+                let is_new = pool_state.last_updated_block == 0;
+
                 // AI Alpha Logic: Verified AI stars require higher liquidity ($10k+)
                 let is_ai_star = t0 == constants::TOKEN_VIRTUAL || t1 == constants::TOKEN_VIRTUAL || 
                                  t0 == constants::TOKEN_LUNA || t1 == constants::TOKEN_LUNA ||
@@ -481,7 +483,7 @@ impl ArbitrageDetector {
                 let is_in_sweet_spot = if is_ai_star {
                     liq_usd >= 500 && liq_usd <= constants::MAX_ALPHA_LIQUIDITY_USD // Lowered to catch early AI moves
                 } else {
-                    is_core || (liq_usd >= 1000 && liq_usd <= constants::MAX_ALPHA_LIQUIDITY_USD) // Catch $1k+ liquidity pools
+                    is_core || (liq_usd >= 1000 && liq_usd <= constants::MAX_ALPHA_LIQUIDITY_USD)
                 };
 
                 // [GHOST-MODE] Anti-Competition Trainer:
@@ -496,7 +498,7 @@ impl ArbitrageDetector {
                 // Re-enabling low-liquidity alpha capture.
                 // Agar pool core hai, alpha hai (new), ya hot hai (activity), toh include karo.
                 let is_niche_dex = dex == DexName::SushiSwap || dex == DexName::BaseSwap || dex == DexName::PancakeSwap;
-                let should_include = is_core || is_alpha || is_hot || is_niche_dex || is_in_sweet_spot;
+                let should_include = is_core || is_alpha || is_hot || is_niche_dex || is_in_sweet_spot || is_new;
                 
                 if !should_include { continue; }
 

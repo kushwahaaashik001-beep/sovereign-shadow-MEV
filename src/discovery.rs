@@ -81,8 +81,8 @@ impl Discovery {
             let (_, provider) = http_pool_for_discovery.get_head(0);
             // Explicitly define type to help compiler inference
             let current_block = provider.get_block_number().await.unwrap_or_default();
-            // [DEEP-DISCOVERY] Scan last 5,000 blocks in batches of 500 to respect Alchemy limits.
-            let lookback = 5000;
+            // [DEEP-DISCOVERY] Scan last 200,000 blocks (~4.5 days) to find established liquidity.
+            let lookback = 200000;
             let mut start_block = current_block.saturating_sub(lookback);
 
             let v2_topic = B256::from(constants::EVENT_V2_PAIR_CREATED);
@@ -92,7 +92,7 @@ impl Discovery {
             let mut total_discovered = 0;
             while start_block < current_block {
                 let (idx, provider) = http_pool_for_discovery.next(); // Rotate key for every batch
-                let end_batch = (start_block + 200).min(current_block); // Smaller batches
+                let end_batch = (start_block + 500).min(current_block); // Standard batches
                 let filter = Filter::new()
                     .from_block(start_block)
                     .to_block(end_batch)
@@ -113,7 +113,8 @@ impl Discovery {
                         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                // Human-like jitter for Hugging Face Shared IP
+                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
             }
             info!("🏁 [PILLAR Z] Warm Start complete. Discovered {} historical pools.", total_discovered);
         });
