@@ -1,6 +1,0 @@
-target/
-.git/
-.env
-logs/
-*.json
-*.csv
