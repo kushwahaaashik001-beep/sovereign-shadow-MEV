@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Semaphore, mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender}};
 use tracing::{info, debug};
 use rustc_hash::FxHasher;
-use std::hash::BuildHasherDefault;
+use std::hash::{BuildHasherDefault};
 use arc_swap::ArcSwap;
 use tokio::time::{self, Duration};
 use dashmap::DashMap;
@@ -21,12 +21,8 @@ use crate::constants;
 use crate::factory_scanner::NewPoolEvent;
 use crate::math_engine::MathEngine;
 
-pub static SWAPS_RECEIVED:   AtomicU64   = AtomicU64::new(0);
-pub static CYCLES_FOUND:     AtomicU64   = AtomicU64::new(0);
-pub static OPPS_SENT:        AtomicU64   = AtomicU64::new(0);
-pub static IGNORED_NO_TOKEN: AtomicU64   = AtomicU64::new(0);
-pub static IGNORED_NO_CYCLE: AtomicU64   = AtomicU64::new(0);
-pub static ACTIVE_POOLS_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static SWAPS_RECEIVED: AtomicU64 = AtomicU64::new(0);
+pub static CYCLES_FOUND: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default, Clone)]
 pub struct StaticGraph {
@@ -83,7 +79,7 @@ impl Default for DetectorConfig {
             flashbots_relay: None,
             signer: None,
             executor_address: Address::ZERO,
-            pool_limit: 3500,
+            pool_limit: 10, // Hard cap for clean logs
         }
     }
 }
@@ -170,7 +166,7 @@ impl ArbitrageDetector {
                 }
                 Ok(pool_event) = self.pool_rx.recv() => {
                     // POWER TECH 1: Reactive Injection
-                    // Naye pool ko turant registry mein daalo aur graph rebuild trigger karo.
+                    // Immediate registry update and graph rebuild for new liquidity events.
                     match pool_event {
                         NewPoolEvent::V2(data) => { 
                             self.pool_registry.insert(data.pair, (data.token_0, data.token_1, data.dex_name));
@@ -415,8 +411,7 @@ impl ArbitrageDetector {
             visited_pools[edge.pool_idx as usize >> 6] |= 1 << (edge.pool_idx & 63);
 
             // Atomic Multi-Hop Logic:
-            // Agar hum target token (e.g. ETH) tak pahunch gaye hain aur hops 2 ya usse zyada hain (Total cycle 3+),
-            // toh ise ek valid multi-hop path maana jayega.
+            // Multi-hop validation: Ensuring cycles contain at least 2 hops for valid arbitrage.
             if edge.target_token_idx == target_token_idx && current_hops.len() >= 1 {
                 results.push(current_hops.clone());
             } else {
@@ -487,8 +482,7 @@ impl ArbitrageDetector {
                 };
 
                 // [GHOST-MODE] Anti-Competition Trainer:
-                // Agar kisi pool par 2 se zyada bots/traders active hain, toh hum use chhod denge.
-                // Big bots usually 5-10 bots se ladte hain. Hum sirf un paths par jayenge jahan 0-1 bot hai.
+                // Competitive filtering: Avoiding overcrowded paths and targeting low-competition cycles.
                 let comp_score = self.state_mirror.get_competition_score(pool_addr);
                 if comp_score > 2 && !is_core {
                     continue; 
@@ -537,7 +531,7 @@ impl ArbitrageDetector {
         }
         static_graph.nodes.push(current_offset); // Sentinel
 
-        info!("🕸️ [PILLAR C] Linearized Graph rebuilt with {} tokens and {} edges", static_graph.tokens.len(), static_graph.edges.len());
+        info!("🧠 [NEURAL-PATH] Multi-dimensional graph optimized: {} tokens | {} routes synchronized", static_graph.tokens.len(), static_graph.edges.len());
         self.graph.store(Arc::new(static_graph));
     }
 

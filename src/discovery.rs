@@ -33,31 +33,22 @@ impl Discovery {
                 NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_USDC, pair: constants::POOL_SUSHI_WETH_USDC, dex_name: DexName::SushiSwap }),
                 NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_USDC, pair: constants::POOL_PANCAKESWAP_WETH_USDC, dex_name: DexName::PancakeSwap }),
 
-                // Alpha Cluster: DEGEN Multi-Hop Bridges
-                // In pools par competition kam hai aur triangular arb ke mauke zyada hain.
+                // Core Alpha: DEGEN & AERO (Top 10 Essential Pairs)
                 NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_AERO, pair: constants::POOL_AERO_WETH_AERO, dex_name: DexName::Aerodrome }),
                 NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_DEGEN, pair: constants::POOL_UNIV2_WETH_DEGEN, dex_name: DexName::UniswapV2 }),
                 NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_USDC, token_1: constants::TOKEN_DEGEN, pair: constants::POOL_UNIV2_USDC_DEGEN, dex_name: DexName::UniswapV2 }),
-
-                // Alpha Cluster: BRETT & Yield Tokens
-                // BRETT/AERO aur BRETT/WETH ke beech price hamesha sync nahi rehta.
                 NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_BRETT, pair: constants::POOL_AERO_WETH_BRETT, dex_name: DexName::Aerodrome }),
-                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_CBETH, token_1: constants::TOKEN_WETH, pair: alloy_primitives::address!("0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"), dex_name: DexName::BaseSwap }),
-
-                // The "Scavenger Bridge": Degen to Ecosystem
-                // Ye rasta bade bots kabhi scan nahi karte.
-                // AI & Social Alpha Hubs
-                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: alloy_primitives::address!("0x0bFbCF9fa4f9C56B0F40a671Ad40E0805A091865"), pair: alloy_primitives::address!("0x3062ad446da2cfdb10266e06bee30f33ba2a6b41"), dex_name: DexName::Aerodrome }), // VIRTUAL/WETH
-                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: alloy_primitives::address!("0x4F9Fd6Be4a90f2620860d680c0d4d5Fb53d1A84E"), pair: alloy_primitives::address!("0x15263a6a1251d75cdf2de83a1251d75cdf2de83a"), dex_name: DexName::UniswapV2 }), // AIXBT
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_CBETH, pair: alloy_primitives::address!("0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"), dex_name: DexName::BaseSwap }),
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_VIRTUAL, pair: alloy_primitives::address!("0x0bFbCF9fa4f9C56B0F40a671Ad40E0805A091865"), dex_name: DexName::Aerodrome }),
                 
-                // Ecosystem Triangular Seeds
-                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_DEGEN, token_1: constants::TOKEN_AERO, pair: alloy_primitives::address!("0x532f27101965dd16442E59d40670Fa5ad5f3fe91"), dex_name: DexName::BaseSwap }),
-                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_LUNA, pair: alloy_primitives::address!("0x4200000000000000000000000000000000000006"), dex_name: DexName::Aerodrome }),
-                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_AI16Z, pair: alloy_primitives::address!("0x30c90069678174577B0Ac49969D7070F7915B597"), dex_name: DexName::UniswapV2 }),
+                // Blue-Chip Expansions (LINK, cbBTC, UNI)
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_CBBTC, pair: alloy_primitives::address!("0x4C36388bE6F416A29C8d8Eee819bb35ed3737a01"), dex_name: DexName::UniswapV3 }),
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_LINK, pair: alloy_primitives::address!("0xf891170fd2a3634f0E215578566473D580fC2f9d"), dex_name: DexName::SushiSwap }),
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_UNI, pair: alloy_primitives::address!("0x38924e59761668b37510074929346d5f1370cc9c"), dex_name: DexName::UniswapV3 }),
                 
                 // Multi-DEX Path Inflation (AlienBase, SwapBased, Sushi)
-                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_USDC, pair: alloy_primitives::address!("0x04C9F118A4864700721A163744021d21DB27c11f"), dex_name: DexName::UniswapV2 }), // SwapBased
-                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_USDC, pair: alloy_primitives::address!("0x3D2d7681335A74Be482D207137f814bA688849E8"), dex_name: DexName::UniswapV2 }), // AlienBase
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_DAI, pair: alloy_primitives::address!("0x04C9F118A4864700721A163744021d21DB27c11f"), dex_name: DexName::UniswapV2 }),
+                NewPoolEvent::V2(V2PoolData { token_0: constants::TOKEN_WETH, token_1: constants::TOKEN_USDT, pair: alloy_primitives::address!("0x3D2d7681335A74Be482D207137f814bA688849E8"), dex_name: DexName::UniswapV2 }),
             ];
 
             let mut count = 0;
@@ -94,8 +85,8 @@ impl Discovery {
             let (_, provider) = http_pool_for_discovery.get_head(0);
             // Explicitly define type to help compiler inference
             let current_block = provider.get_block_number().await.unwrap_or_default();
-            // [DEEP-DISCOVERY] Scan last 200,000 blocks (~4.5 days) to find established liquidity.
-            let lookback = 200000;
+            // [LIGHT-DISCOVERY] Scanning only recent blocks to stay within free tier log limits
+            let lookback = 2000; 
             let mut start_block = current_block.saturating_sub(lookback);
 
             let v2_topic = B256::from(constants::EVENT_V2_PAIR_CREATED);
@@ -105,7 +96,7 @@ impl Discovery {
             let mut total_discovered = 0;
             while start_block < current_block {
                 let (idx, provider) = http_pool_for_discovery.next(); // Rotate key for every batch
-                let end_batch = (start_block + 2000).min(current_block); // Targeted queries allow larger batches
+                let end_batch = (start_block + 250).min(current_block); // Tiny batches for stability
                 let filter = Filter::new()
                     .address(factory_addresses.clone())
                     .from_block(start_block)
@@ -127,8 +118,8 @@ impl Discovery {
                         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                     }
                 }
-                // Human-like jitter for Hugging Face Shared IP
-                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                // Heavy jitter: 5 seconds between log requests
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
             info!("🏁 [PILLAR Z] Warm Start complete. Discovered {} historical pools.", total_discovered);
         });

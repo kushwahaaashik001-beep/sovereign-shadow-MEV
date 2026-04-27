@@ -1,5 +1,4 @@
 //! Shared utilities for the Sovereign Shadow engine.
-#![allow(dead_code)]
 
 use crate::models::MEVError;
 use alloy_primitives::{Address, U256};

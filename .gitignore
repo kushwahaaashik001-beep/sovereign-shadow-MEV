@@ -2,6 +2,8 @@
 /target/
 target/
 **/*.rs.bk
+Cargo.lock
+debug/
 
 # --- DATA & LOGS (GitHub 100MB limit fix) ---
 *.log
@@ -10,23 +12,36 @@ logs/
 data/
 temp/
 
-# --- SMART CONTRACTS (Foundry/Solidity) ---
+# --- SMART CONTRACTS (Foundry/Solidity Artifacts) ---
 out/
 cache/
 broadcast/
+lib/
+**/node_modules/
+package-lock.json
+proto
 
 # --- SECRETS & CONFIG ---
 .env
 *.env
 .pvt
+.dockerignore
+.env.exmple
 
 # --- NODE/SYSTEM JUNK ---
 node_modules/
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/
 
 # --- LOCAL DOCS (Laptop only) ---
 TODO.md
 MISSION_CONTROL.md
-.instructions.md
+README_INSTRUCTIONS.md
+instructions.md
 ARCHITECT_STATE.md
+SOVEREIGN_SHADOW_ROADMAP.md
+HIDDEN_ERRORS.md
+Dockerfile
+

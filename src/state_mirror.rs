@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use dashmap::{DashMap, DashSet};
 use alloy_primitives::{Address, U256, Bytes};
 use alloy::providers::Provider;
@@ -18,7 +17,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-pub const MULTICALL_BATCH_SIZE: usize = 50; // Optimized for Shared IP Environments
+pub const MULTICALL_BATCH_SIZE: usize = 2; // Ultra-safe limit for Free Tier
 pub const PRICE_CACHE_TTL: u64 = 1; // 1-second TTL for HTTP state
 
 sol! {
@@ -129,7 +128,6 @@ pub struct StateMirror {
     pub last_multicall_sync: Arc<AtomicU64>,
     pub storage_cache: Arc<DashMap<(Address, U256), U256, BuildHasherDefault<FxHasher>>>,
     pub sync_filter: Arc<ArcSwap<FxHashSet<Address>>>,
-    pub p2p_priority_feed: Arc<AtomicBool>,
     pub poisoned_accounts: Arc<DashMap<Address, bool, BuildHasherDefault<FxHasher>>>,
     pub trader_registry: Arc<DashMap<Address, DashSet<Address, BuildHasherDefault<FxHasher>>, BuildHasherDefault<FxHasher>>>,
 }
@@ -150,7 +148,6 @@ impl StateMirror {
             last_multicall_sync: Arc::new(AtomicU64::new(0)),
             storage_cache: Arc::new(DashMap::with_hasher(BuildHasherDefault::default())),
             sync_filter: Arc::new(ArcSwap::from_pointee(FxHashSet::default())),
-            p2p_priority_feed: Arc::new(AtomicBool::new(false)),
             poisoned_accounts: Arc::new(DashMap::with_hasher(BuildHasherDefault::default())),
             trader_registry: Arc::new(DashMap::with_hasher(BuildHasherDefault::default())),
         });
@@ -160,7 +157,7 @@ impl StateMirror {
         mirror
     }
 
-    /// [GOD-LEVEL] Persistent Caching: Saves CUs across bot restarts on Hugging Face.
+    /// [GOD-LEVEL] Persistent Caching: Persists state across restarts to save Compute Units.
     fn load_bytecode_cache(map: &DashMap<Address, Bytecode, BuildHasherDefault<FxHasher>>) {
         if let Ok(mut file) = File::open(BYTECODE_CACHE_PATH) {
             let mut buffer = Vec::new();
@@ -373,7 +370,7 @@ impl StateMirror {
             let mirror = self.clone();
             tokio::spawn(async move {
                 tracing::info!("💤 [SMART-BOOTSTRAP] Starting Lazy Sync for {} pools in background...", remaining.len());
-                // Very slow background sync to respect Hugging Face shared IP
+                // Conservative background sync to respect RPC rate limits
                 let _ = mirror.sync_batch_with_jitter(&remaining, rpc_pool, 40).await;
                 tracing::info!("🏁 [SMART-BOOTSTRAP] Background Lazy Sync finished.");
             });
@@ -394,9 +391,9 @@ impl StateMirror {
         use rand::Rng;
 
         for chunk in batch.chunks(dynamic_batch_size) {
-            // [HF-STABILITY] Increased base delay to 1000ms for Shared IP safety
-            let jitter = rand::thread_rng().gen_range(0..200);
-            tokio::time::sleep(Duration::from_millis(1000 + jitter)).await;
+            // High Stability Delay: 4 seconds between multicalls
+            let jitter = rand::thread_rng().gen_range(0..1000);
+            tokio::time::sleep(Duration::from_millis(4000 + jitter)).await;
             
             let (idx, provider) = pool.next(); 
             let multicall = IMulticall3::IMulticall3Instance::new(multicall_addr, provider);
@@ -466,9 +463,9 @@ impl StateMirror {
                 
                 if updates.is_empty() && !chunk.is_empty() {
                     // Point #4: Adaptive Batching Logic
-                    tracing::warn!("⚠️ [429-PROTECT] Empty multicall response. Reducing batch size.");
+                    tracing::debug!("⚠️ [THROTTLE] Selective multicall failure. Adjusting cadence.");
                     pool.mark_unhealthy(idx, 60);
-                    dynamic_batch_size = (dynamic_batch_size / 2).max(50);
+                    dynamic_batch_size = (dynamic_batch_size / 2).max(1);
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                 } else {
                     self.batch_update_reserves(updates);
@@ -523,7 +520,7 @@ impl StateMirror {
             let block_age = if pool.last_updated_block == 0 { 0 } else { current.saturating_sub(pool.last_updated_block) };
             let time_since_access = now.saturating_sub(pool.last_access_ts);
 
-            // [SHADOW-DEX] Persistent RAM: Pruning ko relax kiya hai taaki discover kiye hue 5k pools RAM mein rahein.
+            // [SHADOW-DEX] Persistent RAM: Pruning logic relaxed to keep discovered pools in memory for faster lookup.
             // Updated in last 50 blocks OR accessed in last 5 minutes.
             let is_hot = block_age < 500 || time_since_access < 1800; // Keep for 30 mins
             let is_new = pool.last_updated_block == 0;

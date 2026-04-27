@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::models::{Chain, Opportunity};
 use crate::state_mirror::StateMirror;
 use crate::constants::{KNOWN_COMPETITORS, MIN_BUILDER_TIP_WEI, MAX_BRIBE_PCT};
@@ -99,7 +98,7 @@ impl BiddingEngine {
         }
 
         // 2. Whale Trigger Adjustment
-        // अगर ट्रिगर ट्रांजैक्शन 10 ETH से ज्यादा का है, तो कॉम्पिटिशन ज्यादा होगा।
+        // Increased competition expected for transactions exceeding 10 ETH (Whale alerts).
         let is_whale = opp.is_whale_trigger;
 
         // 3. Adaptive profit-based tiers from constants

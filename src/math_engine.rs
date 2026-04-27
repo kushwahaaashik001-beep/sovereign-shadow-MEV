@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use alloy_primitives::{Address, U256, Uint, I256};
 type U512 = Uint<512, 8>;
 use crate::models::{MempoolTx, Path, DexType};
@@ -12,7 +11,6 @@ pub struct MathEngine;
 // Pre-calculated golden ratio constants for nanosecond pathfinding
 const PHI_NUM: u128 = 618033988749895;
 const PHI_DEN: u128 = 1000000000000000;
-const E18: u128 = 1000000000000000000;
 const SCALE_36: u128 = 1000000000000000000000000000000000000;
 
 impl MathEngine {
@@ -242,24 +240,6 @@ impl MathEngine {
         let x3y = (x_u * x_u * x_u * y_u) / scale;
         let y3x = (y_u * y_u * y_u * x_u) / scale;
         u512_to_u256_safe(x3y + y3x)
-    }
-
-    #[inline(always)]
-    fn get_v3_output(&self, amount_in: U256, state: &PoolState, zero_for_one: bool) -> U256 {
-        if amount_in.is_zero() || state.liquidity.is_zero() { return U256::ZERO; }
-        
-        // Use virtual reserves for GSS optimization (very fast)
-        let (v_res_in, v_res_out) = Self::get_v3_virtual_reserves(state.sqrt_price_x96, state.liquidity, zero_for_one);
-        
-        if v_res_in.is_zero() || v_res_out.is_zero() { return U256::ZERO; }
-        
-        // Apply V3 fee (e.g., 0.05% = 500 pips)
-        let fee_multiplier = 1_000_000u32 - state.fee;
-        let amt_in_with_fee = U512::from(amount_in) * U512::from(fee_multiplier);
-        let numerator = amt_in_with_fee * U512::from(v_res_out);
-        let denominator = (U512::from(v_res_in) * U512::from(1_000_000u64)) + amt_in_with_fee;
-
-        u512_to_u256_safe(numerator / denominator)
     }
 
     /// Pillar D: Newton-Raphson / Secant Optimization

@@ -42,18 +42,10 @@ fn parse_address_robust(s: &str) -> Address {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // Dummy Server for Hugging Face Health Check
-    // Hugging Face expects a web server on port 7860 to keep the Space alive.
-    std::thread::spawn(|| {
-        let listener = std::net::TcpListener::bind("0.0.0.0:7860").unwrap();
-        println!("📢 Dummy Web Server started on port 7860 for Hugging Face");
-        for stream in listener.incoming() {
-            if let Ok(mut stream) = stream {
-                let response = "HTTP/1.1 200 OK\r\n\r\nSovereign Shadow is LIVE!";
-                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
-            }
-        }
-    });
+    // Load environment variables before starting the async runtime
+    if let Err(e) = dotenv() {
+        eprintln!("⚠️ Warning: Could not load .env file: {}", e);
+    }
 
     let core_ids = core_affinity::get_core_ids().expect("Failed to get core IDs");
     let core_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -72,8 +64,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 async fn run_engine() -> Result<(), Box<dyn Error>> {
-    dotenv().ok();
-
     tracing_subscriber::registry()
         .with(fmt::layer())
         .with(EnvFilter::from_default_env().add_directive(LevelFilter::INFO.into()))
@@ -81,7 +71,12 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
 
     info!("🛸 Sovereign Shadow MEV Engine — BEAST MODE ONLINE");
 
-    let chain = the_sovereign_shadow::models::Chain::Base;
+    let chain_raw = env::var("CHAIN").unwrap_or_else(|_| "base".to_string());
+    let chain = if chain_raw.to_lowercase() == "base" {
+        the_sovereign_shadow::models::Chain::Base
+    } else {
+        the_sovereign_shadow::models::Chain::Base
+    };
     info!("⛓️  Chain: {:?}", chain);
 
     // Load WebSocket endpoints for mempool streaming
@@ -107,10 +102,18 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     let priv_key_raw = env::var("PRIVATE_KEY").expect("🚀 Needs PRIVATE_KEY for execution");
     let priv_key = priv_key_raw.trim().trim_start_matches("0x");
 
-    let relay_key_raw = env::var("RELAY_SIGNING_KEY").expect("🚀 Needs RELAY_SIGNING_KEY for MEV-Blocker identity");
-    let relay_key = relay_key_raw.trim().trim_start_matches("0x");
+    let relay_key_raw = env::var("RELAY_SIGNING_KEY").unwrap_or_default();
+    let relay_key_clean = relay_key_raw.trim().trim_start_matches("0x");
 
-    // [GOD-LEVEL] Provider Filtering: Sirf wahi keys use hongi jo actually kaam kar rahi hain.
+    let identity_wallet = if relay_key_clean.is_empty() {
+        warn!("⚠️ RELAY_SIGNING_KEY not found in .env. Using random ephemeral identity for Flashbots.");
+        PrivateKeySigner::random()
+    } else {
+        PrivateKeySigner::from_str(relay_key_clean)
+            .map_err(|e| format!("Failed to parse RELAY_SIGNING_KEY: {}. Ensure it is exactly 64 hex characters.", e))?
+    };
+
+    // [HIGH-AVAILABILITY] Provider Filtering: Select only functional and responsive RPC endpoints.
     let mut working_wss = Vec::new();
     let mut working_ws_providers = Vec::new();
     for url in wss_urls {
@@ -124,6 +127,12 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     }
 
     if working_ws_providers.is_empty() { return Err("No valid WSS endpoints found".into()); }
+    
+    let is_anvil = working_wss.iter().any(|url| url.contains("127.0.0.1") || url.contains("localhost"));
+    if is_anvil {
+        info!("🛠️ [ANVIL-MODE] Local node detected. Bypassing public relay infrastructure for sandbox execution.");
+    }
+
     let ws_provider_pool = Arc::new(WsProviderPool::new(working_ws_providers));
     
     let mut working_http = Vec::new();
@@ -154,7 +163,8 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     let chain_id = ws_setup_provider.get_chain_id().await?;
     info!("🔗 Chain ID: {}", chain_id);
 
-    let wallet = PrivateKeySigner::from_str(priv_key)?;
+    let wallet = PrivateKeySigner::from_str(priv_key)
+        .map_err(|e| format!("Failed to parse PRIVATE_KEY: {}. Ensure it is exactly 64 hex characters.", e))?;
     info!("👛 Wallet: {:?}", wallet.address());
 
     let circuit_breaker = Arc::new(CircuitBreaker::new(5, 30));
@@ -172,10 +182,15 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     let nonce_manager = Arc::new(NonceManager::new(ws_setup_provider.clone(), wallet.address()).await?);
 
     // Pillar E: Dynamic Relay Loading from Secrets
-    let mut relays = vec![
-        "https://relay-base.flashbots.net".to_string(),
-        "https://base.mevblocker.io".to_string(),
-    ];
+    let mut relays = if is_anvil {
+        vec![]
+    } else {
+        vec![
+            "https://relay-base.flashbots.net".to_string(),
+            "https://base.mevblocker.io".to_string(),
+        ]
+    };
+
     if let Ok(custom_relay) = env::var("PRIVATE_RELAY_URL") {
         relays.push(custom_relay);
     }
@@ -183,8 +198,6 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
     let l2_rpcs: Vec<String> = env::var("PRIVATE_RPCS")
         .unwrap_or_default().split(',')
         .filter(|s| !s.is_empty()).map(String::from).collect();
-
-    let identity_wallet = PrivateKeySigner::from_str(relay_key)?;
 
     let state_simulator = Arc::new(StateSimulator::new(state_mirror.clone()));
 
@@ -379,7 +392,7 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
                 let v3_swap = fixed_bytes!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
                 
                 // PILLAR Z: Global Subscription (No address filter)
-                // RPC se sirf topic mango, filtering Rust side par HashSet se hogi.
+                // Event-based filtering: Offloading log filtering to the Rust engine for performance.
                 let filter = alloy::rpc::types::Filter::new().event_signature(vec![v2_sync, v3_swap]);
 
                 let sub_logs = provider.subscribe_logs(&filter).await;
@@ -449,13 +462,13 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    // Pillar Z: Sequential Pool Initialization Worker (HF 429 Shield)
+    // Pillar Z: Sequential Pool Initialization Worker (Rate Limit Shield)
     let (init_tx, mut init_rx) = mpsc::channel::<(Address, the_sovereign_shadow::models::DexType)>(2048);
     let mirror_init = state_mirror.clone();
     let http_pool_init = http_provider_pool.clone();
     tokio::spawn(async move {
         while let Some((pool_addr, dex_type)) = init_rx.recv().await {
-            // Sequential logic ensures we never burst RPC providers on Hugging Face
+            // Sequential logic ensures we never burst RPC providers
             let p = http_pool_init.get_head(1).1;
             mirror_init.fetch_and_cache_bytecode(pool_addr, p.clone()).await;
             
@@ -465,8 +478,8 @@ async fn run_engine() -> Result<(), Box<dyn Error>> {
                 1
             ).await;
             
-            // Extra breathing room between individual pool syncs
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // 4 seconds per pool to avoid burst limits
+            tokio::time::sleep(Duration::from_millis(4000)).await;
         }
     });
 

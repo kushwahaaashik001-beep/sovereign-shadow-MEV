@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::models::{Chain, DexName};
 use crate::constants;
 use alloy_primitives::{Address, B256};
@@ -72,10 +71,9 @@ impl FactoryScanner {
 
         loop {
             // Role: WSS_FACTORY (Head 2)
-            let provider = self.ws_provider_pool.get_head(2);
-            debug_assert!(provider.1.get_chain_id().await.is_ok());
+            let (idx, provider) = self.ws_provider_pool.get_head(2);
 
-            match provider.1.subscribe_logs(&filter.clone()).await {
+            match provider.subscribe_logs(&filter.clone()).await {
                 Ok(sub) => {
                     info!("📡 [Factory Scanner] Subscribed to new pool logs");
                     let mut stream = sub.into_stream();
@@ -88,6 +86,7 @@ impl FactoryScanner {
                 }
                 Err(e) => {
                     error!("❌ Factory Scanner failure: {}. Cooldown 30s...", e);
+                    self.ws_provider_pool.mark_unhealthy(idx, 60);
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 }
             }

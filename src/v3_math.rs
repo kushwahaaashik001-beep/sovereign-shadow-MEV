@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use alloy_primitives::{I256, U256, Uint};
 type U512 = Uint<512, 8>;
 use once_cell::sync::Lazy;

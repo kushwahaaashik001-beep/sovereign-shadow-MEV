@@ -11,6 +11,12 @@ contract SovereignShadowExecutor {
     address public immutable owner;
     address public aavePool;
     address public balancerVault;
+
+    error Unauthorized();
+    error InsufficientProfit();
+    error TransferFailed();
+    error SwapFailedV2();
+    error SwapFailedV3();
     
     address private constant UNI_V2_ROUTER = 0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24; 
     address private constant UNI_V3_ROUTER = 0x2626664c2603381E5c88859d103939a4CF97a299; 
@@ -22,7 +28,7 @@ contract SovereignShadowExecutor {
     }
 
     modifier onlyOwner() {
-        require(msg.sender == owner, "!O");
+        if (msg.sender != owner) revert Unauthorized();
         _;
     }
 
@@ -46,7 +52,7 @@ contract SovereignShadowExecutor {
         uint256[] memory /* feeAmounts */,
         bytes memory userData
     ) external {
-        require(msg.sender == balancerVault, "!V");
+        if (msg.sender != balancerVault) revert Unauthorized();
 
         (bytes memory packedPath, uint256 minProfit) = abi.decode(userData, (bytes, uint256));
         uint256 startBalance = IERC20(tokens[0]).balanceOf(address(this));
@@ -54,20 +60,20 @@ contract SovereignShadowExecutor {
         _performSwaps(packedPath);
 
         uint256 endBalance = IERC20(tokens[0]).balanceOf(address(this));
-        require(endBalance >= startBalance + minProfit, "NP");
+        if (endBalance < startBalance + minProfit) revert InsufficientProfit();
 
-        require(IERC20(tokens[0]).transfer(balancerVault, amounts[0]), "TF");
-        require(IERC20(tokens[0]).transfer(owner, IERC20(tokens[0]).balanceOf(address(this))), "TF");
+        if (!IERC20(tokens[0]).transfer(balancerVault, amounts[0])) revert TransferFailed();
+        if (!IERC20(tokens[0]).transfer(owner, IERC20(tokens[0]).balanceOf(address(this)))) revert TransferFailed();
     }
 
     function withdraw(address token) external onlyOwner {
         uint256 balance = IERC20(token).balanceOf(address(this));
-        require(IERC20(token).transfer(msg.sender, balance), "TF");
+        if (!IERC20(token).transfer(msg.sender, balance)) revert TransferFailed();
     }
 
     function withdrawETH() external onlyOwner {
         (bool success, ) = owner.call{value: address(this).balance}("");
-        require(success, "ETH transfer failed");
+        if (!success) revert TransferFailed();
     }
 
     function _performSwaps(bytes memory packedPath) internal {
@@ -109,14 +115,14 @@ contract SovereignShadowExecutor {
                         amountIn, 0, path, address(this), block.timestamp
                     )
                 );
-                require(success, "V2F");
+                if (!success) revert SwapFailedV2();
             } else { // V3
                 IERC20(tIn).approve(UNI_V3_ROUTER, amountIn);
                 bytes memory params = abi.encode(tIn, tOut, fee, address(this), amountIn, 0, 0);
                 (bool success, ) = UNI_V3_ROUTER.call(
                     abi.encodeWithSignature("exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))", params)
                 );
-                require(success, "V3F");
+                if (!success) revert SwapFailedV3();
             }
         }
     }

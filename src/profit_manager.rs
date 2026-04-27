@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::models::{MEVError, Chain};
 use alloy::providers::{Provider, RootProvider};
 use alloy::transports::BoxTransport;

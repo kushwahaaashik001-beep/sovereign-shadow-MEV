@@ -111,7 +111,7 @@ impl FlashLoanExecutor {
 
         // Pillar L: Ensure bytecode is cached and scanned for honeypot patterns before simulation.
         // Static analysis must happen before dynamic simulation for 100% coverage.
-        // HTTP pool ka use karke rapid fire honeypot checks kar rahe hain.
+        // Utilizing the high-speed HTTP pool for concurrent honeypot and tax validation.
         let mut fetch_tasks = Vec::with_capacity(opp.path.hops.len() * 2);
         let fetch_provider = self.http_pool.as_ref().map(|p| p.get_head(1).1).unwrap_or_else(|| self.provider.clone());
 
@@ -326,7 +326,7 @@ impl FlashLoanExecutor {
                 let err_msg = format!("{:?}", broadcast_results);
                 
                 // Pillar R: Block-Skip Resilience Logic
-                // Agar latency ki wajah se block nikal gaya, toh nonce recycle karke turant agle block ke liye try karo.
+                // Block-skip recovery: Recalculating for the next block if execution misses the current one.
                 let is_stale = err_msg.contains("already passed") || err_msg.contains("stale") || err_msg.contains("expired");
                 if is_stale && attempts < max_resilience_attempts - 1 {
                     warn!("⏳ [BLOCK-SKIP] Block {} passed for opp={}. Re-broadcasting for block {}...", target_block, opp.id, target_block + 1);

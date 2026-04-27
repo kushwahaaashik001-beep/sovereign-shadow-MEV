@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::sync::Arc;
 use alloy_primitives::{Address, U256, Bytes};
 use revm::{
@@ -192,7 +191,7 @@ impl StateSimulator {
         }
 
         // Pillar X: X-Ray Opcode Scan
-        // Hum bytecode ko binary level par scan kar rahe hain un patterns ke liye jo scam define karte hain.
+        // Scanning bytecode at the binary level for malicious patterns and potential scams.
         self.xray_scan_bytecode(token)?;
 
         // 1. Manual Blacklist Check
@@ -227,7 +226,7 @@ impl StateSimulator {
         }
 
         // Pillar L: Liquidity Depth Guardian
-        // Hum ensure kar rahe hain ki hamara trade pool ke liquidity ka 10% se zyada na ho (Price impact protection).
+        // Ensuring trade size does not exceed 10% of pool liquidity for price impact protection.
         if let Some(pool_data) = self.mirror.pools.get(&pool) {
             let pool_reserves = pool_data.reserves0.max(pool_data.reserves1);
             if amount_in_wei > (pool_reserves / U256::from(10)) {
@@ -236,7 +235,7 @@ impl StateSimulator {
         }
 
         // Step 1.1: Verification - Balance Check
-        // Hum confirm kar rahe hain ki token actual mein EOA account mein aaya ya nahi.
+        // Verifying that the token balance was actually received in the executor account.
         let balance_received = self.get_erc20_balance(&mut evm, token, sim_executor)?;
         if balance_received.is_zero() {
             return Err(MEVError::HoneypotDetected("GHOST_TOKEN: Reported success but zero balance".into()));
@@ -260,7 +259,7 @@ impl StateSimulator {
         }
 
         // Step 2: Pillar L: Sell Verification (Simulate EOA -> Pool)
-        // Hum check kar rahe hain ki token wapas pool mein ja raha hai ya nahi.
+        // Testing sellability: ensuring the token can be swapped back to the base asset pool.
         let base_asset_bal_before = self.get_erc20_balance(&mut evm, crate::constants::TOKEN_WETH, sim_executor)?;
         
         let sell_res = self.simulate_transfer(&mut evm, token, sim_executor, pool, balance_received)?;
@@ -269,7 +268,7 @@ impl StateSimulator {
         }
 
         // Step 2.1: Actual Liquidation Check
-        // Agar sell transaction success hai par balance nahi bada, toh ye "Ghost Sell" scam hai.
+        // Honeypot detection: checking if the sell transaction succeeded without increasing the base asset balance.
         let base_asset_bal_after = self.get_erc20_balance(&mut evm, crate::constants::TOKEN_WETH, sim_executor)?;
         if base_asset_bal_after <= base_asset_bal_before && !balance_received.is_zero() {
              return Err(MEVError::HoneypotDetected("LIQUIDATION_FAILED: Sell successful but no base asset received".into()));
@@ -441,7 +440,7 @@ impl StateSimulator {
 
         // Pattern 1: The "Bot Jail" (CALLER + SLOAD + REVERT)
         // Sequence: 0x33 (CALLER) -> ... -> 0x54 (SLOAD) -> ... -> 0xfd (REVERT)
-        // Ye aksar dikhata hai ki contract check kar raha hai ki caller blacklisted hai ya nahi.
+        // Identifying code that restricts transfers based on caller address (blacklist logic).
         let mut has_caller = false;
         let mut has_sload = false;
 
@@ -462,14 +461,14 @@ impl StateSimulator {
             if opcode == 0x33 { has_caller = true; }
             if has_caller && opcode == 0x54 { has_sload = true; }
             if has_sload && (opcode == 0xfd || opcode == 0xfe) {
-                // Re-verification: Agar ye logic small/new tokens mein hai, toh 99% honeypot hai.
+                // Safety check: highly likely a honeypot if this logic exists in small or unverified contracts.
                 if code.len() < 4000 {
                     return Err(MEVError::HoneypotDetected("XRAY: Hidden Blacklist/Jail pattern detected".into()));
                 }
             }
 
             // Pattern 2: Origin Enforcement (0x32: ORIGIN)
-            // Agar contract sirf tx.origin ko check karke transfer allow kar raha hai.
+            // Identifying logic that relies on tx.origin for transfer permissions.
             if opcode == 0x32 && code.len() < 3000 {
                  return Err(MEVError::HoneypotDetected("XRAY: Origin-dependent logic trap".into()));
             }

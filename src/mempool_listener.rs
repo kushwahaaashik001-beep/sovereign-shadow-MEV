@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use alloy_primitives::{Address, B256, U256, fixed_bytes};
 use alloy::rpc::types::{Log, Filter};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
@@ -73,7 +72,6 @@ pub enum ListenerError {
 pub struct MempoolListener {
     config: MempoolListenerConfig,
     event_tx: UnboundedSender<SwapEvent>,
-    priority_tx: UnboundedSender<SwapEvent>,
     seen_hashes: Arc<DashSet<B256, BuildHasherDefault<FxHasher>>>,
 }
 
@@ -81,19 +79,16 @@ impl MempoolListener {
     pub async fn new(
         config: MempoolListenerConfig,
         _grpc_tx: Option<UnboundedSender<SwapEvent>>,
-    ) -> Result<(Self, UnboundedReceiver<SwapEvent>, UnboundedReceiver<SwapEvent>), ListenerError> {
+    ) -> Result<(Self, UnboundedReceiver<SwapEvent>), ListenerError> {
         let (event_tx, event_rx) = unbounded_channel();
-        let (priority_tx, priority_rx) = unbounded_channel();
 
         Ok((
             Self { 
                 config, 
                 event_tx, 
-                priority_tx, 
                 seen_hashes: Arc::new(DashSet::with_capacity_and_hasher(100_000, BuildHasherDefault::default())),
             },
             event_rx,
-            priority_rx,
         ))
     }
 
